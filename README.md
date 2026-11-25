@@ -84,3 +84,7 @@ As três leituras no topo indicam o motivo da decisão; o cartão verde marca a 
 O comando USB `probe` faz uma sondagem independente em 30°, 60°, 90°, 120° e 150°, com as rodas paradas. O servo avança em passos de até 3° a cada 45 ms, equivalentes a 1° por 15 ms, acomoda por 220 ms em cada posição e volta a 90°. São três disparos separados por 70 ms. A capacidade aparece em `quickProbe` e o resultado em `scanKind: quick`, sem misturar a leitura com uma varredura completa.
 
 O painel mede a frente entre pulsos. Ao bloquear depois de mover, usa a leitura rápida antes de varrer tudo. Depois de dois giros ou 25 cm de deslocamento estimado, atualiza a referência com uma varredura completa. Só essa varredura altera o mapa persistente. O painel mostra a camada incerta mais recente; as marcas confirmadas são conservadas até duas varreduras completas confiáveis comprovarem espaço livre.
+
+### Recuperação de bloqueios
+
+O contorno violeta indica as células que impedem a manobra. A leitura curta (USB) pode retirar o veto de um eco provisório quando a pose é comparável e um retorno válido passa além da célula. Uma marca confirmada continua exigindo duas varreduras completas. Se a leitura curta não alcançar a margem, o painel volta à varredura completa. O controlador tenta giros de 25°, 15°, 10° e 5° conforme a folga e o tempo mínimo de pulso. A ré continua limitada ao último trecho conhecido. Se nenhuma opção tiver folga, o robô espera e mede de novo.

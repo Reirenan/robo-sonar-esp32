@@ -23,6 +23,7 @@ class Navigator:
         self.scan_kind = "full"
         self.quick_supported = False
         self.side_readings_current = False
+        self.turn_attempts = set()
         self.since_scan = 0.0
         self.turns_since_scan = 0
         self.last_direction = None
@@ -105,6 +106,9 @@ class Navigator:
         self.last_direction = direction if elapsed else None
         if elapsed:
             self.map.integrate(direction, elapsed)
+            self.side_readings_current = False
+            if direction in {"f","b"} and cell(before.x,before.y) != cell(self.map.pose.x,self.map.pose.y):
+                self.turn_attempts.clear()
             if direction in {"f","b"}:
                 self.since_scan += elapsed * rate / 1000
         outcome = state["autoEnd"]
@@ -117,7 +121,6 @@ class Navigator:
             elif direction in {"l","r"}:
                 self.turns_since_scan += 1
                 self.rear_origin = None
-                self.side_readings_current = False
         if self.automatic and direction == "f" and outcome in {"e","o"}:
             self.map.blocked.add(self.map.chave_direcao(self.map.pose.heading))
             self.wait_reason = ("Sem eco frontal" if outcome == "e" else "Obstáculo frontal")
@@ -157,36 +160,52 @@ class Navigator:
         # a ocupação nem contar como uma confirmação de remoção do mapa.
         return median(samples) if len(samples) == 3 else None
 
+    def turn_key(self, degrees):
+        pose = self.map.pose
+        return (*cell(pose.x,pose.y),round(pose.heading/15)%24,degrees)
+
     def available_turn(self, sign):
         if not self.side_readings_current:
             return None,0,"Aguardando varredura no novo rumo"
         points = dict(self.scan_points)
-        # Uma abertura precisa aparecer em dois feixes vizinhos. O menor
-        # retorno determina a folga da direção pretendida.
-        options = []
         spans = ((60,30),) if self.scan_kind == "quick" else tuple((a,a-10) for a in (40,50,60,70))
-        for far,near in spans:
-            distances = [points.get(90+sign*far),points.get(90+sign*near)]
-            if all(value is not None and value > 45 for value in distances):
-                options.append((min(distances),sign*min(far,25)))
-        if not options:
-            sector = [points.get(90+sign*offset) for offset in range(30,71,10)]
-            valid = [value for value in sector if value is not None]
+        pairs = [[points.get(90+sign*far),points.get(90+sign*near)] for far,near in spans]
+        openings = [min(pair) for pair in pairs
+                    if all(value is not None and value > 45 for value in pair)]
+        sector = [points.get(90+sign*offset) for offset in range(30,71,10)]
+        valid = [value for value in sector if value is not None]
+        if not any(value > 45 for value in valid):
             return (min(valid),0,"Passagem lateral sem folga") if valid else (None,0,"Sem eco lateral")
-        distance,turn = max(options)
-        target = self.map.pose.heading + sign*45
-        if self.map.direction_blocked(target):
+        distance = max(openings) if openings else max(valid)
+        if self.map.direction_blocked(self.map.pose.heading + sign*45):
             return distance,0,"Direção bloqueada na última tentativa"
-        if not self.map.swept_clear(turn=turn):
-            return distance,0,"Chassi sem folga no giro"
-        return distance,turn,"Giro disponível"
+        blockers = set()
+        for size in ((25,15,10,5) if openings else (15,10,5)):
+            turn = sign*size
+            if self.turn_key(turn) in self.turn_attempts:
+                continue
+            rate = self.map.arena.left_rate if sign < 0 else self.map.arena.right_rate
+            if size / rate < .040:
+                continue
+            cells = self.map.swept_blockers(turn=turn)
+            if not cells:
+                return distance,turn,"Giro disponível" if size==25 else f"Giro curto de {size}° disponível"
+            if not blockers or len(cells)<len(blockers):
+                blockers = cells
+        self.map.maneuver_blockers["l" if sign<0 else "r"] = blockers
+        return distance,0,"Chassi sem folga no giro" if blockers else "Giros já avaliados nesta posição"
 
     def decision(self, front, allow_turn):
         m = self.map
         m.selected_direction = None
+        m.maneuver_blockers = {}
         step = min(m.arena.speed*.350,25-self.since_scan)
         forward = front is not None and front > 45 and step >= m.arena.speed*.040
-        forward = forward and m.swept_clear(distance=step) and m.uncertainty <= 30
+        if forward:
+            blockers = m.swept_blockers(distance=step)
+            if blockers:
+                m.maneuver_blockers["f"] = blockers
+            forward = not blockers and m.uncertainty <= 30
         left,lt,lreason = self.available_turn(-1)
         right,rt,rreason = self.available_turn(1)
         freason = ("Sem eco confiável" if front is None else "Obstáculo até 45 cm"
@@ -201,6 +220,9 @@ class Navigator:
             for direction,turn in (("l",lt),("r",rt)):
                 if turn:
                     m.selected_direction = direction
+                    self.turn_attempts.add(self.turn_key(turn))
+                    if abs(turn)<25:
+                        self.notify("Tentando giro curto à " + ("esquerda" if direction=="l" else "direita"))
                     if self.turn(turn):
                         return True
             if self.backtrack():
@@ -302,6 +324,17 @@ class Navigator:
                         continue
                     break
                 continue
+            groups = self.map.maneuver_blockers
+            blocked_cells = set().union(*groups.values()) if groups else set()
+            if self.quick_supported and blocked_cells:
+                side = "esquerda" if groups.get("l") else "direita" if groups.get("r") else "frontal"
+                self.notify(f"Reavaliando margem {side}")
+                outside = self.map.blockers_outside_quick(blocked_cells)
+                if self.decision(self.quick_observe(), allow_turn=True):
+                    continue
+                if outside:
+                    self.notify("Atualizando mapa · margem fora da leitura curta")
+                    continue
             self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
                         else "Aguardando passagem segura · "+self.wait_reason)
             for _ in range(4):

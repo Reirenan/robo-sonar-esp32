@@ -57,7 +57,7 @@ class Panel:
         view = ttk.Frame(body)
         view.pack(fill="both",expand=True)
         self.legend = ttk.Label(body,padding=(0,8),
-                                text="Azul: livre   ·   Vermelho: obstáculo   ·   Âmbar: em revisão   ·   Verde: trajetória")
+                                text="Azul: livre   ·   Vermelho: obstáculo   ·   Âmbar: em revisão   ·   Violeta: bloqueio da manobra   ·   Verde: trajetória")
         self.legend.pack(side="bottom",anchor="w")
         self.viewport = None
         self.canvas = tk.Canvas(view, bg="#0b151c", highlightthickness=0)
@@ -115,6 +115,7 @@ class Panel:
         result.awaiting_echo = set(model.awaiting_echo)
         result.directions = dict(model.directions)
         result.selected_direction = model.selected_direction
+        result.maneuver_blockers = {d:set(keys) for d,keys in model.maneuver_blockers.items()}
         result.localized = model.localized
         result.passages = {key: value.copy() for key,value in model.passages.items()}
         return result
@@ -194,6 +195,11 @@ class Panel:
             ax,ay = xy(i*CELL,(j+1)*CELL)
             bx,by = xy((i+1)*CELL,j*CELL)
             c.create_rectangle(ax,ay,bx,by,outline="#ffad5a",width=2)
+        blockers = getattr(m,"maneuver_blockers",{})
+        for i,j in set().union(*blockers.values()) if blockers else ():
+            ax,ay = xy(i*CELL,(j+1)*CELL)
+            bx,by = xy((i+1)*CELL,j*CELL)
+            c.create_rectangle(ax,ay,bx,by,outline="#b8a2ff",width=2)
         for i,j in getattr(m,"awaiting_echo",set()) - m.clearing.keys():
             ax,ay = xy(i*CELL,(j+1)*CELL)
             bx,by = xy((i+1)*CELL,j*CELL)
