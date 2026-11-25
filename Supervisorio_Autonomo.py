@@ -110,7 +110,7 @@ class Panel:
         result = MapaAutomatico(model.profile)
         result.pose, result.trail = model.pose, list(model.trail)
         result.cells = model.cells.copy()
-        result.tentative = set(model.tentative)
+        result.tentative = set(model.quick_hits if model.quick_active else model.tentative)
         result.clearing = dict(model.clearing)
         result.awaiting_echo = set(model.awaiting_echo)
         result.directions = dict(model.directions)
@@ -229,6 +229,9 @@ class Panel:
         dx,dy = relative(90, m.arena.radius, m.pose.heading)
         c.create_oval(ox-4,oy-4,ox+4,oy+4,fill="white",outline="")
         c.create_line(ox,oy,*xy(m.pose.x+dx,m.pose.y+dy),arrow="last",fill="white",width=2)
+        c.create_text(width-18,height-17,anchor="e",
+                      text="Pose confirmada" if m.localized else "Pose estimada",
+                      fill="#dce7f2" if m.localized else "#f5c667")
         c.create_line(18,height-17,18+50*scale,height-17,fill="#dce7f2",width=2)
         c.create_text(25+50*scale,height-17,anchor="w",text="50 cm" if m.localized else "≈ 50 cm",fill="white")
 

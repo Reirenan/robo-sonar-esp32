@@ -27,6 +27,10 @@ static_assert(ANGLE_STEP <= 10 && LAST_ANGLE % ANGLE_STEP == 0);
 constexpr uint8_t POINTS = LAST_ANGLE / ANGLE_STEP + 1;
 constexpr uint32_t FIRST_SETTLE_MS = 700, SERVO_STEP_MS = 45, STEP_SETTLE_MS = 300, PING_MS = 70;
 constexpr uint8_t SAMPLES_PER_POINT = 5, MIN_AGREEING_SAMPLES = 3;
+constexpr uint8_t QUICK_FIRST = 30, QUICK_LAST = 150, QUICK_ANGLE_STEP = 30;
+constexpr uint8_t QUICK_POINTS = 5, QUICK_SAMPLES = 3;
+constexpr uint8_t QUICK_SERVO_STEP_DEG = 3;
+constexpr uint32_t QUICK_SERVO_STEP_MS = 45, QUICK_SETTLE_MS = 220;
 constexpr char AP_NAME[] = "Robo-Sonar";
 constexpr char AP_PASSWORD[] = "sonar-2026";
 
@@ -64,6 +68,7 @@ uint8_t angle = HOME_ANGLE;
 uint8_t tries = 0, validCount = 0;
 float validSamples[SAMPLES_PER_POINT];
 uint8_t scanTarget = HOME_ANGLE;
+bool quickScan = false;
 uint8_t scanEchoes = 0, scanValidEchoes = 0;
 uint32_t pingAt = 0;
 uint32_t advanceStartedAt = 0;
@@ -165,11 +170,16 @@ bool setAngle(uint8_t requested) {
   return true;
 }
 
+uint32_t scanDelay() {
+  if (angle == scanTarget) return quickScan ? QUICK_SETTLE_MS : STEP_SETTLE_MS;
+  return quickScan ? QUICK_SERVO_STEP_MS : SERVO_STEP_MS;
+}
+
 void prepareScanMove(uint8_t target) {
   scanTarget = target;
   tries = 0;
   validCount = 0;
-  pingAt = millis() + (angle == target ? STEP_SETTLE_MS : SERVO_STEP_MS);
+  pingAt = millis() + scanDelay();
 }
 
 unsigned long measureEchoUs() {
@@ -244,12 +254,13 @@ void updateAuto() {
   }
 }
 
-void startScan() {
+void startScan(bool quick) {
+  quickScan = quick;
   count = 0;
   scanEchoes = 0;
   scanValidEchoes = 0;
   scanState = ScanState::homing;
-  prepareScanMove(LEFT_ANGLE);
+  prepareScanMove(quickScan ? QUICK_FIRST : LEFT_ANGLE);
 }
 
 void stopAndScan(AdvanceEnd reason) {
@@ -267,7 +278,7 @@ void stopAndScan(AdvanceEnd reason) {
 void updateAdvance() {
   const uint32_t now = millis();
   if (scanState == ScanState::settling) {
-    if (static_cast<int32_t>(now - pingAt) >= 0) startScan();
+    if (static_cast<int32_t>(now - pingAt) >= 0) startScan(false);
     return;
   }
   const bool moving = scanState == ScanState::advancing;
@@ -342,9 +353,15 @@ void updateScan() {
 
   if (moving) {
     if (angle != scanTarget) {
-      const uint8_t next = angle < scanTarget ? angle + 1 : angle - 1;
+      const uint32_t startedAt = millis();
+      const int remaining = int(scanTarget) - int(angle);
+      const int distance = min(abs(remaining), quickScan ? int(QUICK_SERVO_STEP_DEG) : 1);
+      const uint8_t next = angle + (remaining > 0 ? distance : -distance);
       if (setAngle(next)) {
-        pingAt = millis() + (angle == scanTarget ? STEP_SETTLE_MS : SERVO_STEP_MS);
+        // Usar o início do passo evita somar a latência do GPIO ao intervalo.
+        // A acomodação final sempre conta a partir da última escrita no PWM.
+        const uint32_t base = quickScan && angle != scanTarget ? startedAt : millis();
+        pingAt = base + scanDelay();
       }
       return;
     }
@@ -365,7 +382,7 @@ void updateScan() {
     ++scanValidEchoes;
     validSamples[validCount++] = cm;
   }
-  if (++tries < SAMPLES_PER_POINT) {
+  if (++tries < (quickScan ? QUICK_SAMPLES : SAMPLES_PER_POINT)) {
     pingAt = startedAt + PING_MS;
     return;
   }
@@ -375,12 +392,12 @@ void updateScan() {
   if (filtered >= 0) Serial.printf("[SONAR] %u graus | %.1f cm\n", unsigned(angle), filtered);
   else Serial.printf("[SONAR] %u graus | sem eco confiavel\n", unsigned(angle));
 
-  if (angle == LAST_ANGLE) {
+  if (angle == (quickScan ? QUICK_LAST : LAST_ANGLE)) {
     scanState = ScanState::returning;
     prepareScanMove(HOME_ANGLE);
   } else {
     scanState = ScanState::moving;
-    prepareScanMove(angle + ANGLE_STEP);
+    prepareScanMove(angle + (quickScan ? QUICK_ANGLE_STEP : ANGLE_STEP));
   }
 }
 
@@ -422,7 +439,10 @@ String buildState() {
   json += ",\"maxCm\":";
   json += String(MAX_CM);
   json += ",\"total\":";
-  json += String(POINTS);
+  json += String(quickScan ? QUICK_POINTS : POINTS);
+  json += ",\"quickProbe\":true,\"scanKind\":\"";
+  json += quickScan ? "quick" : "full";
+  json += '"';
   uint32_t elapsed = 0;
   if (motorLock != nullptr) {
     xSemaphoreTake(motorLock, portMAX_DELAY);
@@ -456,7 +476,7 @@ String buildState() {
   for (uint8_t i = 0; i < count; ++i) {
     if (i) json += ',';
     json += '[';
-    for (uint8_t j = 0; j < SAMPLES_PER_POINT; ++j) {
+    for (uint8_t j = 0; j < (quickScan ? QUICK_SAMPLES : SAMPLES_PER_POINT); ++j) {
       if (j) json += ',';
       json += String(rawPulses[i][j]);
     }
@@ -497,7 +517,7 @@ int applyCommand(const String& action, const char*& error) {
     stopMotors();
     frontCm = -1.0f;
     advanceEnd = AdvanceEnd::none;
-    startScan();
+    startScan(false);
   } else if (action == "advance") {
     if (activityRunning() || motorBusy(true) || !motorReady || !servoReady) {
       error = "Avanço indisponível. Confira o servo e aguarde o robô parar.";
@@ -583,6 +603,15 @@ void handleUsbRequest(const char* line) {
       autoActive = true;
       autoLastContact = millis();
     }
+  } else if (strcmp(action, "probe") == 0) {
+    // A sondagem curta pertence à sessão USB. A máquina de estados de
+    // varredura mantém as rodas bloqueadas até o retorno a 90 graus.
+    if (!autoActive || activityRunning() || motorBusy(true) || !servoReady) {
+      error = "Leitura rápida indisponível neste estado.";
+      status = 409;
+    } else {
+      startScan(true);
+    }
   } else if (strncmp(action, "auto_", 5) == 0) {
     status = startAuto(action, error);
   } else if (strcmp(action, "state") != 0) {
@@ -663,7 +692,7 @@ void loop() {
   updateUsb();
   updateAuto();
   // Um cliente HTTP lento não pode atrasar a leitura frontal durante o pulso.
-  if (!motorBusy(false)) server.handleClient();
+  if (!motorBusy(false) && !(quickScan && activityRunning())) server.handleClient();
   updateAdvance();
   updateScan();
   delay(1);

@@ -205,6 +205,76 @@ class BuscaAutomaticaTest(unittest.TestCase):
             self.assertTrue(nav.decision(80,allow_turn=False))
         move.assert_called_once_with("f",4,25)
 
+    def test_ecos_incertos_de_varreduras_antigas_nao_acumulam(self):
+        model = MapaAutomatico()
+        model.scan([(90,45)])
+        model.integrate("l",100)
+        old_mark = cell(0,45)
+        with patch("Navegacao.reconhecer_pose",return_value=None):
+            model.scan([(90,120)])
+            first = set(model.tentative)
+            model.scan([(90,150)])
+        self.assertTrue(first)
+        self.assertFalse(first & model.tentative)
+        self.assertEqual(model.cells[old_mark],OCCUPIED)
+
+    def test_sondagem_nao_altera_mapa_nem_votos(self):
+        model = MapaAutomatico()
+        model.scan([(90,45)])
+        target = cell(0,45)
+        model.scan([(90,120)])
+        self.assertEqual(model.clearing[target],1)
+        before = dict(model.cells)
+        model.quick_observation([(90,120),(30,40)])
+        self.assertEqual(model.cells,before)
+        self.assertEqual(model.clearing[target],1)
+        self.assertTrue(model.quick_hits)
+
+    def test_sondagem_curta_escolhe_lateral_sem_varredura_completa(self):
+        model,nav = self.direcoes()
+        result = {"state":"done","scanKind":"quick","angle":90,
+                  "points":[[30,70],[60,65],[90,32],[120,80],[150,85]]}
+        with patch.object(nav,"command") as command, patch.object(nav,"wait_for",return_value=result):
+            front = nav.quick_observe()
+        command.assert_called_once_with("probe")
+        with patch.object(nav,"turn",return_value=True) as turn:
+            self.assertTrue(nav.decision(front, allow_turn=True))
+        turn.assert_called_once_with(-25)
+        self.assertEqual(model.selected_direction,"l")
+
+    def test_sondagem_curta_recusa_resultado_incompleto(self):
+        _,nav = self.direcoes()
+        with patch.object(nav,"command"), patch.object(nav,"wait_for",
+                 return_value={"state":"done","scanKind":"quick","angle":120,"points":[]}):
+            with self.assertRaisesRegex(RuntimeError,"incompleta"):
+                nav.quick_observe()
+
+    def test_ciclo_pega_lateral_rapida_antes_de_atualizar_mapa(self):
+        from ControleAutonomo import StopRequested
+        model,nav = self.direcoes()
+        nav.quick_supported = True
+        calls = []
+
+        def observe():
+            calls.append("completa")
+            if len(calls) > 1:
+                raise StopRequested
+
+        def decide(front,allow_turn):
+            calls.append((front,allow_turn))
+            if front == 99:
+                nav.since_scan = 25
+            return front in {30,99}
+
+        with patch.object(nav,"observe",side_effect=observe), \
+             patch.object(nav,"front_probe",return_value=None), \
+             patch.object(nav,"quick_observe",return_value=99) as quick, \
+             patch.object(nav,"decision",side_effect=decide):
+            with self.assertRaises(StopRequested):
+                nav.explore()
+        quick.assert_called_once()
+        self.assertEqual(calls,["completa",(30,True),(None,False),(99,True),"completa"])
+
     def test_busca_fica_ativa_apos_passagem_ou_falta_de_rota(self):
         model = MapaAutomatico()
         model.passages[(0,0,1)] = {"at":[0,0],"axis":1,"crossed":True}

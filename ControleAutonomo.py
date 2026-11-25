@@ -20,8 +20,11 @@ class Navigator:
         self.automatic = isinstance(arena_map, MapaAutomatico)
         self.valid_scan = False
         self.scan_points = []
+        self.scan_kind = "full"
+        self.quick_supported = False
         self.side_readings_current = False
         self.since_scan = 0.0
+        self.turns_since_scan = 0
         self.last_direction = None
         self.reverse_limit = 0
         self.rear_origin = None
@@ -55,12 +58,14 @@ class Navigator:
         raise RuntimeError("A ESP32 não concluiu a operação a tempo.")
 
     def observe(self):
-        self.notify("Varrendo a arena com as rodas paradas")
+        self.notify("Atualizando mapa · rodas paradas")
         self.command("start")
         state = self.wait_for(lambda s: s["state"] == "done", 45)
         self.scan_points = state["points"]
+        self.scan_kind = "full"
         self.side_readings_current = True
         self.since_scan = 0.0
+        self.turns_since_scan = 0
         self.valid_scan = any(returns(self.scan_points))
         self.map.scan(state["points"])
         summary = "Posição de referência confirmada" if self.map.localized else "Posição estimada"
@@ -69,6 +74,20 @@ class Navigator:
         if getattr(self.map,"awaiting_echo",None):
             summary += f" · {len(self.map.awaiting_echo)} aguardando confirmação de eco"
         self.notify(summary)
+
+    def quick_observe(self):
+        self.notify("Leitura rápida · rodas paradas")
+        self.command("probe")
+        state = self.wait_for(lambda data: data["state"] == "done",12)
+        points = state["points"]
+        if (state.get("scanKind") != "quick" or state["angle"] != 90
+                or [angle for angle,_ in points] != [30,60,90,120,150]):
+            raise RuntimeError("Sondagem curta incompleta.")
+        self.scan_points = points
+        self.scan_kind = "quick"
+        self.side_readings_current = True
+        self.map.quick_observation(points)
+        return dict(points).get(90)
 
     def move(self, direction, amount, rate):
         # O pulso é indivisível na placa e limitado a 350 ms. Após cada pulso,
@@ -86,7 +105,7 @@ class Navigator:
         self.last_direction = direction if elapsed else None
         if elapsed:
             self.map.integrate(direction, elapsed)
-            if direction == "f":
+            if direction in {"f","b"}:
                 self.since_scan += elapsed * rate / 1000
         outcome = state["autoEnd"]
         if self.automatic and elapsed:
@@ -96,6 +115,7 @@ class Navigator:
                     self.rear_origin, self.rear_heading = before, before.heading
                 self.forward_at = time.monotonic()
             elif direction in {"l","r"}:
+                self.turns_since_scan += 1
                 self.rear_origin = None
                 self.side_readings_current = False
         if self.automatic and direction == "f" and outcome in {"e","o"}:
@@ -144,11 +164,11 @@ class Navigator:
         # Uma abertura precisa aparecer em dois feixes vizinhos. O menor
         # retorno determina a folga da direção pretendida.
         options = []
-        for offset in (40,50,60,70):
-            angle = 90 + sign*offset
-            distances = [points.get(angle),points.get(angle-sign*10)]
+        spans = ((60,30),) if self.scan_kind == "quick" else tuple((a,a-10) for a in (40,50,60,70))
+        for far,near in spans:
+            distances = [points.get(90+sign*far),points.get(90+sign*near)]
             if all(value is not None and value > 45 for value in distances):
-                options.append((min(distances),sign*min(offset,25)))
+                options.append((min(distances),sign*min(far,25)))
         if not options:
             sector = [points.get(90+sign*offset) for offset in range(30,71,10)]
             valid = [value for value in sector if value is not None]
@@ -272,11 +292,15 @@ class Navigator:
             self.observe()
             front = dict(self.scan_points).get(90)
             if self.decision(front, allow_turn=True):
-                # Após giro ou avanço, a próxima frente é medida na nova
-                # pose. Uma manobra lateral exige nova varredura completa.
-                while self.last_direction in {"f","l","r"} and self.since_scan < 25-self.map.arena.speed*.040:
-                    if not self.decision(self.front_probe(), allow_turn=False):
-                        break
+                # A cada pulso, a nova frente pode evitar até mesmo a
+                # leitura curta. Se fechar, mede os lados antes de remapear.
+                while (self.since_scan < 25-self.map.arena.speed*.040
+                       and self.turns_since_scan < 2):
+                    if self.decision(self.front_probe(), allow_turn=False):
+                        continue
+                    if self.quick_supported and self.decision(self.quick_observe(), allow_turn=True):
+                        continue
+                    break
                 continue
             self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
                         else "Aguardando passagem segura · "+self.wait_reason)
@@ -293,6 +317,7 @@ class Navigator:
             if not state["servoReady"] or not state["motorReady"] or state["motorBusy"]:
                 return "Confira o servo e a ponte H e aguarde o robô parar."
             self.reverse_limit = min(120,state.get("reverseMaxMs",0))
+            self.quick_supported = bool(state.get("quickProbe"))
             self.command("auto_begin")
             self.owns_session = True
             if self.automatic:

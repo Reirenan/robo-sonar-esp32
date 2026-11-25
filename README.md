@@ -77,3 +77,10 @@ O estado serial inclui `reverseMaxMs` e `rawPulses`. Os cinco pulsos brutos em m
 Execute `python -B -m unittest discover -s testes -p "teste_*.py" -v`. Os testes reproduzem orientação, persistência, cancelamento, perda de comunicação, busca e remoção de obstáculos. No robô, valide também o curso do servo, a folga de giro e a distância de parada com rodas no piso. As medidas e o comportamento físico dependem da montagem.
 
 As três leituras no topo indicam o motivo da decisão; o cartão verde marca a direção escolhida. O sonar frontal continua sendo o veto de avanço em tempo real.
+
+
+### Decisão rápida e pontos incertos
+
+O comando USB `probe` faz uma sondagem independente em 30°, 60°, 90°, 120° e 150°, com as rodas paradas. O servo avança em passos de até 3° a cada 45 ms, equivalentes a 1° por 15 ms, acomoda por 220 ms em cada posição e volta a 90°. São três disparos separados por 70 ms. A capacidade aparece em `quickProbe` e o resultado em `scanKind: quick`, sem misturar a leitura com uma varredura completa.
+
+O painel mede a frente entre pulsos. Ao bloquear depois de mover, usa a leitura rápida antes de varrer tudo. Depois de dois giros ou 25 cm de deslocamento estimado, atualiza a referência com uma varredura completa. Só essa varredura altera o mapa persistente. O painel mostra a camada incerta mais recente; as marcas confirmadas são conservadas até duas varreduras completas confiáveis comprovarem espaço livre.

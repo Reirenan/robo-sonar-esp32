@@ -400,6 +400,8 @@ class MapaAutomatico(Map):
         self.stationary_reference = True
         self.awaiting_echo = set()
         self.directions = {}
+        self.quick_hits = set()
+        self.quick_active = False
         self.selected_direction = None
 
     @property
@@ -425,14 +427,21 @@ class MapaAutomatico(Map):
             if len(self.trail) > 1:
                 self.trail[-1] = corrected
         pose = self.pose
+        self.quick_active = False
+        self.quick_hits.clear()
         hits, free = set(), set()
         for angle, cm in returns(points):
             dx,dy = relative(angle,cm,pose.heading)
             hits.add(cell(pose.x+dx,pose.y+dy))
             free.update(ray_cells(pose.x,pose.y,dx,dy,CELL))
         if self.has_scan and not self.localized:
-            self.tentative.update(hits - {k for k in hits if self.cells.get(k) == OCCUPIED})
+            self.tentative = hits - {k for k in hits if self.cells.get(k) == OCCUPIED}
+            # Votos de limpeza de marcas confirmadas são preservados; ecos
+            # transitórios anteriores deixam de interferir no próximo quadro.
+            self.clearing = {k:v for k,v in self.clearing.items()
+                             if self.cells.get(k) == OCCUPIED or k in self.tentative}
         else:
+            self.tentative.clear()
             for key in hits:
                 self.cells[key] = OCCUPIED
                 self.tentative.discard(key)
@@ -470,6 +479,16 @@ class MapaAutomatico(Map):
             if cm > 55 and self.localized:
                 self.blocked.discard(self.chave_direcao(pose.heading+angle-90))
         self.observar_passagens(hits)
+
+    def quick_observation(self, points):
+        # A leitura curta pode impedir uma manobra logo após um eco novo.
+        # Ela não abre células, relocaliza ou vota pela remoção de obstáculos.
+        pose = self.pose
+        self.quick_active = True
+        self.quick_hits.clear()
+        for angle, cm in returns(points):
+            dx,dy = relative(angle,cm,pose.heading)
+            self.quick_hits.add(cell(pose.x+dx,pose.y+dy))
 
     def clear_disk(self, x, y):
         # Ecos de posição incerta ainda impedem que o planejador passe sobre
@@ -513,7 +532,7 @@ class MapaAutomatico(Map):
             dx,dy = relative(90,distance*fraction,pose.heading)
             swept.update(self.body_cells(pose.x+dx,pose.y+dy,pose.heading+turn*fraction,padding))
         for key in swept:
-            if self.cells.get(key) == OCCUPIED or key in self.tentative:
+            if self.cells.get(key) == OCCUPIED or key in self.tentative or key in self.quick_hits:
                 return False
             if key not in under_robot and self.cells.get(key) != FREE:
                 return False
@@ -521,7 +540,7 @@ class MapaAutomatico(Map):
 
     def clear_reverse_body(self, x, y):
         padding = MARGIN + min(self.uncertainty,CELL)
-        return all(self.cells.get(key) == FREE and key not in self.tentative
+        return all(self.cells.get(key) == FREE and key not in self.tentative and key not in self.quick_hits
                    for key in self.body_cells(x,y,self.pose.heading,padding))
 
     def observar_passagens(self, hits):
