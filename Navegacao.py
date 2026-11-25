@@ -403,6 +403,7 @@ class MapaAutomatico(Map):
         self.quick_hits = set()
         self.quick_active = False
         self.selected_direction = None
+        self.selected_gap = None
         self.maneuver_blockers = {}
         self.tentative_reference = None
         self.quick_free = set()

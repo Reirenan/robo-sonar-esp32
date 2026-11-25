@@ -20,14 +20,14 @@ class RecuperacaoTest(unittest.TestCase):
         mapa = MapaAutomatico()
         nav = Navigator(None,mapa,Event(),lambda _: None)
         nav.side_readings_current = True
-        nav.scan_points = [(angle,80) for angle in range(0,181,10)]
+        nav.scan_points = [(angle,80 if angle < 90 else 30) for angle in range(0,181,10)]
         with patch.object(mapa,"swept_blockers",
                           side_effect=lambda **kw: {(0,0)} if abs(kw["turn"])>10 else set()):
-            self.assertEqual(nav.available_turn(-1)[1],-10)
+            self.assertEqual(nav.gap_turns()[0][0][2],-10)
             nav.turn_attempts.add(nav.turn_key(-10))
-            self.assertEqual(nav.available_turn(-1)[1],-5)
+            self.assertEqual(nav.gap_turns()[0][0][2],-5)
             nav.turn_attempts.add(nav.turn_key(-5))
-            self.assertEqual(nav.available_turn(-1)[1],0)
+            self.assertFalse(nav.gap_turns()[0])
             self.assertEqual(mapa.maneuver_blockers["l"],{(0,0)})
 
     def test_sem_eco_preserva_veto_na_mesma_pose(self):

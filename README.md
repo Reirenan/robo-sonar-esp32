@@ -62,7 +62,7 @@ Alimente o SG90 e o HC-SR04 com 5 V regulados e compartilhe o GND com a ESP32 e 
 ### Movimento e segurança
 
 - O perfil interno pressupõe um chassi de **25 × 30 cm**, velocidade de **25 cm/s** e giros de **100°/s**. São referências conservadoras de software e a escala é estimada. Se o chassi real for maior, ajuste o perfil em `Navegacao.py` antes de usar a autonomia.
-- O robô avança em pulsos de até **350 ms** e confere a frente entre eles. Faz varredura completa ao ligar a exploração, ao bloquear e ao atingir o limite de **25 a 50 cm estimados**. Se a frente fechar, tenta esquerda e depois direita. Os giros no lugar usam PWM **175/180**, em sentidos opostos, e conferem a área varrida pelo retângulo do chassi. Ao avançar, a ESP32 corta a tração se detectar um obstáculo a **45 cm ou menos**, ou se o sonar deixar de receber eco. O corte de tempo e a perda do vínculo USB também são tratados pela placa.
+- O robô avança em pulsos de até **350 ms** e confere a frente entre eles. Faz varredura completa ao ligar a exploração, ao bloquear e ao atingir o limite de **25 a 50 cm estimados**. Se a frente fechar, escolhe a abertura verificável mais larga com Follow the Gap. Os giros no lugar usam PWM **175/180**, em sentidos opostos, e conferem a área varrida pelo retângulo do chassi. Ao avançar, a ESP32 corta a tração se detectar um obstáculo a **45 cm ou menos**, ou se o sonar deixar de receber eco. O corte de tempo e a perda do vínculo USB também são tratados pela placa.
 - O planejador prioriza fronteiras e usa células livres para retornar a uma área com outras direções possíveis. Se cair numa situação sem passagem observável, mantém as rodas paradas, informa **Aguardando passagem segura** e volta a medir. Uma queda da COM3 encerra a sessão.
 - Uma passagem provável precisa de bordas observadas e de folga medível dos dois lados. Sem delimitar o perímetro, o sonar não consegue garantir que a passagem é a saída da arena. A marca some após duas varreduras válidas além dela. Com o robô imóvel, vale a última posição confiável. Depois de mover as rodas, o sonar precisa reconhecer a posição novamente. Âmbar com **1/2** indica a primeira confirmação. Uma marca sem retorno correspondente continua aguardando confirmação.
 
@@ -88,3 +88,9 @@ O painel mede a frente entre pulsos. Ao bloquear depois de mover, usa a leitura 
 ### Recuperação de bloqueios
 
 O contorno violeta indica as células que impedem a manobra. A leitura curta (USB) pode retirar o veto de um eco provisório quando a pose é comparável e um retorno válido passa além da célula. Uma marca confirmada continua exigindo duas varreduras completas. Se a leitura curta não alcançar a margem, o painel volta à varredura completa. O controlador tenta giros de 25°, 15°, 10° e 5° conforme a folga e o tempo mínimo de pulso. A ré continua limitada ao último trecho conhecido. Se nenhuma opção tiver folga, o robô espera e mede de novo.
+
+### Follow the Gap com ultrassom
+
+Quando o avanço não tem folga, o painel agrupa os ecos acima de 45 cm em ângulos consecutivos. Cada abertura exige pelo menos dois raios. A largura é estimada pela corda entre os extremos, calculada no menor alcance do grupo e limitada à profundidade de 100 cm. Exige-se a largura do chassi mais 10 cm. O rumo aponta para o centro do grupo maior, com preferência pelo menor giro em empate e pela esquerda no empate final.
+
+O mapa ainda verifica a área ocupada durante o giro. Depois de girar, o sonar confere a nova frente antes de avançar. Sem rumo permissível na leitura curta, o painel usa a varredura completa antes de avaliar a ré. No mapa, as linhas tracejadas em ciano mostram a abertura e a seta ciano indica o rumo escolhido. O firmware existente é compatível.

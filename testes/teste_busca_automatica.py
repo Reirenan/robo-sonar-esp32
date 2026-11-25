@@ -165,12 +165,12 @@ class BuscaAutomaticaTest(unittest.TestCase):
         self.assertEqual(model.selected_direction,"f")
         move.assert_called_once_with("f",8.75,25)
 
-    def test_esquerda_antes_da_direita(self):
+    def test_direita_quando_a_abertura_e_maior(self):
         model,nav = self.direcoes(left=70,right=130)
         with patch.object(nav,"turn",return_value=True) as turn:
             self.assertTrue(nav.decision(32,allow_turn=True))
-        self.assertEqual(model.selected_direction,"l")
-        turn.assert_called_once_with(-25)
+        self.assertEqual(model.selected_direction,"r")
+        turn.assert_called_once_with(25)
 
     def test_tenta_direita_quando_esquerda_esta_ocupada(self):
         model,nav = self.direcoes(left=30,right=100)
@@ -239,8 +239,8 @@ class BuscaAutomaticaTest(unittest.TestCase):
         command.assert_called_once_with("probe")
         with patch.object(nav,"turn",return_value=True) as turn:
             self.assertTrue(nav.decision(front, allow_turn=True))
-        turn.assert_called_once_with(-25)
-        self.assertEqual(model.selected_direction,"l")
+        turn.assert_called_once_with(25)
+        self.assertEqual(model.selected_direction,"r")
 
     def test_sondagem_curta_recusa_resultado_incompleto(self):
         _,nav = self.direcoes()

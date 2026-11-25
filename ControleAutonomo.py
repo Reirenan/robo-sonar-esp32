@@ -1,9 +1,41 @@
 """Ciclo da exploração. O despacho serial fica em uma única thread do painel."""
+from dataclasses import dataclass
 import math
 import time
 from statistics import median
 
 from Navegacao import MapaAutomatico, cell, delta, relative, returns
+
+
+@dataclass(frozen=True)
+class Abertura:
+    first: int
+    last: int
+    depth: float
+
+    @property
+    def center(self):
+        return (self.first + self.last) / 2
+
+    @property
+    def width(self):
+        # Corda entre os raios extremos na menor distância observada.
+        return 2 * min(self.depth, 100) * math.sin(math.radians(self.last - self.first) / 2)
+
+
+def encontrar_aberturas(points, angular_step):
+    """Agrupa ecos úteis sem atravessar setores ausentes ou sem retorno."""
+    runs = []
+    current = []
+    for angle, cm in sorted(points):
+        if current and (cm is None or not 45 < cm <= 400 or angle - current[-1][0] != angular_step):
+            runs.append(current)
+            current = []
+        if cm is not None and 45 < cm <= 400:
+            current.append((angle, cm))
+    runs.append(current)
+    return [Abertura(run[0][0], run[-1][0], min(cm for _, cm in run))
+            for run in runs if len(run) >= 2]
 
 
 class StopRequested(Exception):
@@ -164,36 +196,52 @@ class Navigator:
         pose = self.map.pose
         return (*cell(pose.x,pose.y),round(pose.heading/15)%24,degrees)
 
-    def available_turn(self, sign):
-        if not self.side_readings_current:
-            return None,0,"Aguardando varredura no novo rumo"
-        points = dict(self.scan_points)
-        spans = ((60,30),) if self.scan_kind == "quick" else tuple((a,a-10) for a in (40,50,60,70))
-        pairs = [[points.get(90+sign*far),points.get(90+sign*near)] for far,near in spans]
-        openings = [min(pair) for pair in pairs
-                    if all(value is not None and value > 45 for value in pair)]
-        sector = [points.get(90+sign*offset) for offset in range(30,71,10)]
-        valid = [value for value in sector if value is not None]
-        if not any(value > 45 for value in valid):
-            return (min(valid),0,"Passagem lateral sem folga") if valid else (None,0,"Sem eco lateral")
-        distance = max(openings) if openings else max(valid)
-        if self.map.direction_blocked(self.map.pose.heading + sign*45):
-            return distance,0,"Direção bloqueada na última tentativa"
-        blockers = set()
-        for size in ((25,15,10,5) if openings else (15,10,5)):
-            turn = sign*size
-            if self.turn_key(turn) in self.turn_attempts:
+    def gap_turns(self):
+        m = self.map
+        points = self.scan_points if self.side_readings_current else []
+        openings = encontrar_aberturas(points, 30 if self.scan_kind == "quick" else 10)
+        cards = {}
+        for side, sign in (("l", -1), ("r", 1)):
+            echoes = [cm for angle, cm in points if (angle - 90) * sign > 0 and cm is not None]
+            reason = "Aguardando leitura no novo rumo" if not self.side_readings_current else "Sem eco lateral"
+            if echoes:
+                reason = "Abertura estreita ou sem feixes consecutivos"
+            cards[side] = (min(echoes) if echoes else None, reason)
+
+        ranked = sorted(openings, key=lambda gap: (-gap.width, abs(gap.center - 90), gap.center))
+        options = []
+        for gap in ranked:
+            offset = gap.center - 90
+            if gap.width < m.arena.robot_width + 10 or not offset:
                 continue
-            rate = self.map.arena.left_rate if sign < 0 else self.map.arena.right_rate
-            if size / rate < .040:
+            side = "l" if offset < 0 else "r"
+            if m.direction_blocked(m.pose.heading + offset):
+                cards[side] = (gap.depth, "Rumo bloqueado na última tentativa")
                 continue
-            cells = self.map.swept_blockers(turn=turn)
-            if not cells:
-                return distance,turn,"Giro disponível" if size==25 else f"Giro curto de {size}° disponível"
-            if not blockers or len(cells)<len(blockers):
-                blockers = cells
-        self.map.maneuver_blockers["l" if sign<0 else "r"] = blockers
-        return distance,0,"Chassi sem folga no giro" if blockers else "Giros já avaliados nesta posição"
+            rate = m.arena.left_rate if offset < 0 else m.arena.right_rate
+            primary = min(abs(offset), 25)
+            sizes = [primary] + [size for size in (15, 10, 5) if size < primary]
+            blockers = set()
+            turn = 0
+            for size in sizes:
+                candidate = math.copysign(size, offset)
+                if self.turn_key(candidate) in self.turn_attempts or size / rate < .040:
+                    continue
+                cells = m.swept_blockers(turn=candidate)
+                if not cells:
+                    turn = candidate
+                    break
+                if not blockers or len(cells) < len(blockers):
+                    blockers = cells
+            if turn:
+                options.append((gap, side, turn))
+                cards[side] = (gap.depth, f"Abertura estimada: {gap.width:.0f} cm")
+                m.maneuver_blockers.pop(side, None)
+            elif not any(option[1] == side for option in options):
+                if blockers:
+                    m.maneuver_blockers[side] = blockers
+                cards[side] = (gap.depth, "Chassi sem folga no giro" if blockers else "Giros já avaliados")
+        return options, cards
 
     def scan_budget(self):
         # Em trecho saudável a frente é conferida a cada pulso. O orçamento
@@ -206,6 +254,7 @@ class Navigator:
     def decision(self, front, allow_turn):
         m = self.map
         m.selected_direction = None
+        m.selected_gap = None
         m.maneuver_blockers = {}
         distance_budget, _ = self.scan_budget()
         step = min(m.arena.speed*.350,distance_budget-self.since_scan)
@@ -215,26 +264,27 @@ class Navigator:
             if blockers:
                 m.maneuver_blockers["f"] = blockers
             forward = not blockers and m.uncertainty <= 30
-        left,lt,lreason = self.available_turn(-1)
-        right,rt,rreason = self.available_turn(1)
+        options, cards = self.gap_turns()
         freason = ("Sem eco confiável" if front is None else "Obstáculo até 45 cm"
                    if front <= 45 else "Passagem livre" if forward else "Faixa sem folga confirmada")
-        m.directions = {"l": (left,lreason), "f": (front,freason), "r": (right,rreason)}
+        m.directions = {**cards, "f": (front, freason)}
         if forward:
             m.selected_direction = "f"
             return self.move("f",step,m.arena.speed)
         if not allow_turn:
             return False
         if m.uncertainty <= 30:
-            for direction,turn in (("l",lt),("r",rt)):
-                if turn:
-                    m.selected_direction = direction
-                    self.turn_attempts.add(self.turn_key(turn))
-                    if abs(turn)<25:
-                        self.notify("Tentando giro curto à " + ("esquerda" if direction=="l" else "direita"))
-                    if self.turn(turn):
-                        return True
-            if self.backtrack():
+            for gap, direction, turn in options:
+                m.selected_direction = direction
+                m.selected_gap = (m.pose, gap)
+                m.directions[direction] = (gap.depth, f"Rumo {gap.center - 90:+.0f}° · abertura {gap.width:.0f} cm")
+                self.turn_attempts.add(self.turn_key(turn))
+                if self.turn(turn):
+                    return True
+            m.selected_direction = None
+            m.selected_gap = None
+            # Uma sondagem esparsa nunca é suficiente para optar pela ré.
+            if self.scan_kind == "full" and self.backtrack():
                 return True
         self.wait_reason = "Posição incerta" if m.uncertainty > 30 else freason + " · sem manobra com folga"
         return False

@@ -115,6 +115,7 @@ class Panel:
         result.awaiting_echo = set(model.awaiting_echo)
         result.directions = dict(model.directions)
         result.selected_direction = model.selected_direction
+        result.selected_gap = model.selected_gap
         result.maneuver_blockers = {d:set(keys) for d,keys in model.maneuver_blockers.items()}
         result.localized = model.localized
         result.passages = {key: value.copy() for key,value in model.passages.items()}
@@ -231,6 +232,17 @@ class Panel:
             sx,sy = xy(*m.exit["at"])
             c.create_oval(sx-6,sy-6,sx+6,sy+6,fill="#71e0a5" if m.exited else "#f4c65f",outline="")
             c.create_text(sx+9,sy-11,anchor="w",text="Saída confirmada" if m.exited else "Saída candidata",fill="#f4c65f")
+        selection = getattr(m, "selected_gap", None)
+        if selection:
+            pose, gap = selection
+            start = xy(pose.x, pose.y)
+            for angle in (gap.first, gap.center, gap.last):
+                dx,dy = relative(angle, min(gap.depth, 100), pose.heading)
+                end = xy(pose.x + dx, pose.y + dy)
+                if angle == gap.center:
+                    c.create_line(*start, *end, fill="#5ce4ea", width=3, arrow="last")
+                else:
+                    c.create_line(*start, *end, fill="#5ce4ea", dash=(5,3))
         ox,oy = xy(m.pose.x,m.pose.y)
         dx,dy = relative(90, m.arena.radius, m.pose.heading)
         c.create_oval(ox-4,oy-4,ox+4,oy+4,fill="white",outline="")
