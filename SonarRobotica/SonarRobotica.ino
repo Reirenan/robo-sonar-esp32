@@ -14,7 +14,10 @@ constexpr float OBSTACLE_CM = 45.0f;
 
 // Calibre os extremos para o seu SG90 e inverta se 0 graus apontar para a direita.
 constexpr uint16_t SERVO_MIN_US = 1000, SERVO_MAX_US = 2000;
-constexpr bool REVERSE_SERVO = false;
+// Nesta montagem o pulso menor apontava para a direita. O mapa sempre
+// recebe o ângulo lógico: 0° à esquerda, 90° à frente, 180° à direita.
+constexpr bool REVERSE_SERVO = true;
+constexpr uint32_t AUTO_MAX_MS = 350, AUTO_LEASE_MS = 2500;
 constexpr uint16_t MAX_CM = 400;
 constexpr uint8_t ANGLE_STEP = 10, LEFT_ANGLE = 0, LAST_ANGLE = 180;
 constexpr uint8_t CENTER_ANGLE = LAST_ANGLE / 2;
@@ -34,6 +37,16 @@ int64_t motorDeadline = 0;
 uint32_t motorStoppedAt = 0;
 bool motorReady = false;
 bool servoReady = false;
+
+// Os tempos usam o relógio da ESP32, pois a latência USB não representa
+// tempo de tração. O callback de corte e o loop compartilham o mutex.
+int64_t autoStartedUs = 0;
+uint32_t autoElapsedMs = 0;
+uint32_t autoPingAt = 0;
+char autoDirection = 0;
+bool autoActive = false;
+uint32_t autoLastContact = 0;
+char autoEnd = 'i';  // i: inativo, t: tempo, o: obstáculo, e: sem eco, s: Parar.
 
 enum class ScanState { idle, checking, advancing, settling, homing, moving, running, returning, stopped, done, error };
 enum class AdvanceEnd { none, obstacle, noEcho, timeLimit, motorFailure };
@@ -68,6 +81,13 @@ void stopMotorsLocked() {
   ledcWrite(RIGHT_ENABLE, 0);
   digitalWrite(LEFT_FWD, LOW);
   digitalWrite(RIGHT_FWD, LOW);
+  digitalWrite(LEFT_REV, LOW);
+  digitalWrite(RIGHT_REV, LOW);
+  if (autoStartedUs != 0) {
+    const int64_t elapsed = esp_timer_get_time() - autoStartedUs;
+    autoElapsedMs = static_cast<uint32_t>(elapsed / 1000);
+    autoStartedUs = 0;
+  }
   if (motorDeadline != 0) {
     motorDeadline = 0;
     motorStoppedAt = millis();
@@ -99,15 +119,18 @@ bool motorBusy(bool includeSettling) {
   return busy;
 }
 
-bool startForward(uint32_t durationMs) {
+bool startMotion(uint32_t durationMs, char direction) {
   if (!motorReady || motorBusy(true)) return false;
   xSemaphoreTake(motorLock, portMAX_DELAY);
-  digitalWrite(LEFT_REV, LOW);
-  digitalWrite(RIGHT_REV, LOW);
-  digitalWrite(LEFT_FWD, HIGH);
-  digitalWrite(RIGHT_FWD, HIGH);
+  // Num giro no lugar as duas rodas têm sentidos opostos.
+  digitalWrite(LEFT_REV, direction == 'l' ? HIGH : LOW);
+  digitalWrite(RIGHT_REV, direction == 'r' ? HIGH : LOW);
+  digitalWrite(LEFT_FWD, direction == 'l' ? LOW : HIGH);
+  digitalWrite(RIGHT_FWD, direction == 'r' ? LOW : HIGH);
   const bool powered = ledcWrite(LEFT_ENABLE, PWM_LEFT) && ledcWrite(RIGHT_ENABLE, PWM_RIGHT);
-  motorDeadline = esp_timer_get_time() + durationMs * 1000ULL;
+  const int64_t now = esp_timer_get_time();
+  autoStartedUs = direction && powered ? now : 0;
+  motorDeadline = now + durationMs * 1000ULL;
   const bool timed = powered && esp_timer_start_once(motorTimer, durationMs * 1000ULL) == ESP_OK;
   if (!timed) stopMotorsLocked();
   xSemaphoreGive(motorLock);
@@ -157,6 +180,64 @@ float echoDistanceCm(unsigned long pulseUs) {
   return pulseUs * 0.0343f / 2.0f;
 }
 
+bool checkAutoFront() {
+  frontCm = echoDistanceCm(measureEchoUs());
+  if (frontCm < 2.0f || frontCm > MAX_CM) {
+    frontCm = -1.0f;
+    autoEnd = 'e';
+    return false;
+  }
+  if (frontCm <= OBSTACLE_CM) {
+    autoEnd = 'o';
+    return false;
+  }
+  return true;
+}
+
+int startAuto(const char* action, const char*& error) {
+  const char direction = action[5];
+  char* end = nullptr;
+  if ((direction != 'f' && direction != 'l' && direction != 'r') || action[6] != '_') {
+    error = "Direção autônoma inválida.";
+    return 400;
+  }
+  const unsigned long duration = strtoul(action + 7, &end, 10);
+  if (*end || duration < 40 || duration > AUTO_MAX_MS) {
+    error = "Pulso de tração fora do intervalo de 40 a 350 ms.";
+    return 400;
+  }
+  if (!autoActive || activityRunning() || motorBusy(true) || !servoReady || !motorReady || angle != CENTER_ANGLE) {
+    error = "Aguarde as rodas pararem e centralize o sensor.";
+    return 409;
+  }
+
+  autoElapsedMs = 0;
+  autoEnd = 't';
+  autoDirection = 0;
+  if (direction == 'f' && !checkAutoFront()) return 200;
+  if (!startMotion(duration, direction)) {
+    error = "Falha ao iniciar movimento autônomo.";
+    return 503;
+  }
+  autoDirection = direction;
+  autoPingAt = millis() + PING_MS;
+  return 200;
+}
+
+void updateAuto() {
+  if (autoDirection == 0) return;
+  if (!motorBusy(false)) {
+    autoDirection = 0;
+    return;
+  }
+  if (autoDirection != 'f' || static_cast<int32_t>(millis() - autoPingAt) < 0) return;
+  autoPingAt = millis() + PING_MS;
+  if (!checkAutoFront()) {
+    stopMotors();
+    autoDirection = 0;
+  }
+}
+
 void startScan() {
   count = 0;
   scanEchoes = 0;
@@ -199,7 +280,7 @@ void updateAdvance() {
   } else if (frontCm <= OBSTACLE_CM) {
     stopAndScan(AdvanceEnd::obstacle);
   } else if (!moving) {
-    if (!startForward(ADVANCE_WATCHDOG_MS)) {
+    if (!startMotion(ADVANCE_WATCHDOG_MS, 0)) {
       stopAndScan(AdvanceEnd::motorFailure);
       return;
     }
@@ -335,6 +416,19 @@ String buildState() {
   json += String(MAX_CM);
   json += ",\"total\":";
   json += String(POINTS);
+  uint32_t elapsed = 0;
+  if (motorLock != nullptr) {
+    xSemaphoreTake(motorLock, portMAX_DELAY);
+    elapsed = autoElapsedMs;
+    xSemaphoreGive(motorLock);
+  }
+  json += ",\"autoVersion\":1,\"autoElapsedMs\":";
+  json += String(elapsed);
+  json += ",\"autoActive\":";
+  json += autoActive ? "true" : "false";
+  json += ",\"autoEnd\":\"";
+  json += autoEnd;
+  json += '"';
   json += ",\"scanEchoes\":";
   json += String(scanEchoes);
   json += ",\"scanValidEchoes\":";
@@ -360,6 +454,11 @@ void sendState() {
 
 int applyCommand(const String& action, const char*& error) {
   if (action == "stop") {
+    autoActive = false;
+    if (autoDirection) {
+      autoEnd = 's';
+      autoDirection = 0;
+    }
     if (activityRunning()) scanState = ScanState::stopped;
     stopMotors();
   } else if (action == "clear") {
@@ -404,7 +503,7 @@ int applyCommand(const String& action, const char*& error) {
       return 503;
     }
   } else if (action == "motor") {
-    if (activityRunning() || !startForward(MOTOR_TEST_MS)) {
+    if (activityRunning() || !startMotion(MOTOR_TEST_MS, 0)) {
       error = "Teste indisponível durante a varredura ou a parada.";
       return 409;
     }
@@ -424,8 +523,13 @@ void command() {
     server.send(403, "text/plain", "Comando recusado.");
     return;
   }
+  const String action = server.arg("action");
+  if (autoActive && action != "stop") {
+    server.send(409, "text/plain; charset=utf-8", "A exploração USB está em andamento.");
+    return;
+  }
   const char* error = nullptr;
-  const int status = applyCommand(server.arg("action"), error);
+  const int status = applyCommand(action, error);
   if (status == 200) sendState();
   else server.send(status, "text/plain; charset=utf-8", error);
 }
@@ -450,7 +554,21 @@ void handleUsbRequest(const char* line) {
   }
 
   const char* error = nullptr;
-  const int status = strcmp(action, "state") == 0 ? 200 : applyCommand(action, error);
+  int status = 200;
+  if (autoActive) autoLastContact = millis();
+  if (strcmp(action, "auto_begin") == 0) {
+    if (autoActive || activityRunning() || motorBusy(true) || !motorReady || !servoReady) {
+      error = "A exploração não pode iniciar neste estado.";
+      status = 409;
+    } else {
+      autoActive = true;
+      autoLastContact = millis();
+    }
+  } else if (strncmp(action, "auto_", 5) == 0) {
+    status = startAuto(action, error);
+  } else if (strcmp(action, "state") != 0) {
+    status = applyCommand(action, error);
+  }
   Serial.printf("@%lu %d ", id, status);
   if (status == 200) Serial.println(buildState());
   else Serial.println(error);
@@ -517,8 +635,16 @@ void setup() {
 }
 
 void loop() {
+  // O corte de PWM é independente. A concessão USB também cancela a
+  // varredura e libera o painel manual se o supervisório parar de responder.
+  if (autoActive && millis() - autoLastContact > AUTO_LEASE_MS) {
+    const char* error = nullptr;
+    applyCommand("stop", error);
+  }
   updateUsb();
-  server.handleClient();
+  updateAuto();
+  // Um cliente HTTP lento não pode atrasar a leitura frontal durante o pulso.
+  if (!motorBusy(false)) server.handleClient();
   updateAdvance();
   updateScan();
   delay(1);

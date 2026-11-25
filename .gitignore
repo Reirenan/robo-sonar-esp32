@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.bin
+*.elf
+*.map
+*.log
+/mapa-sessao.json
+/mapa-sessao.tmp

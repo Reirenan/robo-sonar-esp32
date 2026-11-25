@@ -1,10 +1,10 @@
 """Painel de bancada para a ESP32, com comunicação USB direta."""
 from concurrent.futures import ThreadPoolExecutor
-from math import cos, radians, sin
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from Abrir_supervisorio import SerialBridge
+from Navegacao import relative
 
 LABELS = {
     "idle": "Pronto", "checking": "Checando a frente", "advancing": "Avançando",
@@ -160,8 +160,9 @@ class Supervisory:
                 continue
 
             def position(angle, distance):
-                scale = distance / maximum * radius
-                return x0 - cos(radians(angle)) * scale, y0 - sin(radians(angle)) * scale
+                dx, dy = relative(angle, distance)
+                scale = radius / maximum
+                return x0 + dx * scale, y0 - dy * scale
 
             grid = "#375360"
             canvas.create_line(x0-radius, y0, x0+radius, y0, fill=grid)
