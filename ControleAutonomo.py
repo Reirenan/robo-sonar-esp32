@@ -293,26 +293,31 @@ class Navigator:
         pose = m.pose
         position = cell(pose.x,pose.y)
         choices = sorted((-1,1),key=lambda sign: (self.survey_turns[position,sign],sign))
-        for sign in choices:
-            turn = sign * 10
-            key = self.turn_key(turn)
-            rate = m.arena.left_rate if sign < 0 else m.arena.right_rate
-            if self.survey_turns[position,sign] >= 2 or key in self.turn_attempts or 10 / rate < .040:
-                continue
-            blockers = m.swept_blockers(turn=turn)
-            side = "l" if sign < 0 else "r"
-            if blockers:
-                m.maneuver_blockers[side] = blockers
-                distance, _ = m.directions.get(side, (None, ""))
-                m.directions[side] = (distance, "Chassi sem folga no giro")
-                continue
-            self.turn_attempts.add(key)
-            self.survey_turns[position,sign] += 1
-            m.selected_direction = side
-            self.notify("Giro de observação de 10° à " + ("esquerda" if sign < 0 else "direita"))
-            if self.turn(turn):
-                self.survey_turn_pending = self.quick_supported
-                return True
+        # Se a célula ocupada bloquear 10°, ainda pode haver folga
+        # para observar após 5°. Ambas as manobras usam a mesma margem.
+        for size in (10,5):
+            for sign in choices:
+                turn = sign * size
+                key = self.turn_key(turn)
+                rate = m.arena.left_rate if sign < 0 else m.arena.right_rate
+                if self.survey_turns[position,sign] >= 2 or key in self.turn_attempts or size / rate < .040:
+                    continue
+                blockers = m.swept_blockers(turn=turn)
+                side = "l" if sign < 0 else "r"
+                if blockers:
+                    m.maneuver_blockers[side] = blockers
+                    distance, _ = m.directions.get(side, (None, ""))
+                    m.directions[side] = (distance, "Chassi sem folga no giro")
+                    continue
+                self.turn_attempts.add(key)
+                self.survey_turns[position,sign] += 1
+                m.maneuver_blockers.pop(side, None)
+                m.selected_direction = side
+                direction = "esquerda" if sign < 0 else "direita"
+                self.notify(f"Giro de observação de {size}° à {direction}")
+                if self.turn(turn):
+                    self.survey_turn_pending = self.quick_supported
+                    return True
         m.selected_direction = None
         return False
 

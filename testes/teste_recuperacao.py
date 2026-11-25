@@ -1,8 +1,10 @@
 import unittest
 from threading import Event
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from ControleAutonomo import Navigator
-from Navegacao import FREE, MapaAutomatico, OCCUPIED
+from Navegacao import FREE, Map, MapaAutomatico, OCCUPIED, PerfilAutomatico, Pose
 
 class RecuperacaoTest(unittest.TestCase):
     def test_releitura_libera_incerteza_sem_apagar_ocupacao(self):
@@ -235,3 +237,30 @@ class RecuperacaoTest(unittest.TestCase):
             mapa.scan([(90, 80)])
             self.assertTrue(nav.decision(80, allow_turn=False))
         move.assert_called_once_with("f", 8.75, 25)
+
+    def test_sonar_na_ponta_projeta_leituras_a_partir_do_sensor(self):
+        mapa = MapaAutomatico(PerfilAutomatico(sensor_forward=12))
+        mapa.scan([(90, 22.6)])
+        self.assertEqual(mapa.cells[0, 3], OCCUPIED)
+        self.assertNotEqual(mapa.cells[0, 2], OCCUPIED)
+        mapa.pose = Pose(0, 0, 180)
+        mapa.quick_observation([(90, 22.6)])
+        self.assertEqual(mapa.quick_hits, {(0, -4)})
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "mapa.json"
+            mapa.save(path)
+            self.assertEqual(Map.load(path).profile.sensor_forward, 12)
+
+    def test_sonar_na_ponta_e_giro_de_cinco_graus_com_a_leitura_real(self):
+        ecos = [22.3, 21.4, 25.2, 35, 35, 20.8, 20.8, 20.8, 21.7, 22.6,
+                21.4, 39.6, 42.1, 37, 40.3, 39.1, 38.9, 37.5, 37.3]
+        mapa = MapaAutomatico(PerfilAutomatico(sensor_forward=12))
+        nav = Navigator(None, mapa, Event(), lambda _: None)
+        nav.valid_scan = nav.side_readings_current = True
+        nav.scan_points = list(zip(range(0, 181, 10), ecos))
+        mapa.scan(nav.scan_points)
+        self.assertFalse(mapa.swept_clear(turn=-10))
+        self.assertTrue(mapa.swept_clear(turn=-5))
+        with patch.object(nav, "move", return_value=True) as move:
+            self.assertTrue(nav.decision(22.6, allow_turn=True))
+        move.assert_called_once_with("l", 5, 100)

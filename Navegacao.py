@@ -338,13 +338,14 @@ class PerfilAutomatico:
     speed: float = 25
     left_rate: float = 100
     right_rate: float = 100
+    sensor_forward: float = 0  # Distância do centro do chassi ao eixo do sonar, em cm.
 
     @property
     def radius(self):
         return math.hypot(self.robot_width, self.robot_length) / 2 + MARGIN
 
 
-def reconhecer_pose(cells, predicted, points):
+def reconhecer_pose(cells, predicted, points, sensor_forward=0):
     """Procura ecos repetidos em dois alinhamentos diferentes do mapa."""
     references = {k for k, value in cells.items() if value == OCCUPIED}
     surfaces = {
@@ -360,23 +361,25 @@ def reconhecer_pose(cells, predicted, points):
     for da in (0,-5,5,-10,10):
         heading = (predicted.heading + da) % 360
         projected = [relative(a,d,heading) for a,d in samples]
+        sensor_x, sensor_y = relative(90, sensor_forward, heading)
         for dx in (0,-5,5,-10,10):
             for dy in (0,-5,5,-10,10):
                 x, y = predicted.x+dx, predicted.y+dy
                 horizontal, vertical = set(), set()
                 residual = 0
                 for px,py in projected:
-                    key = cell(x+px,y+py)
+                    echo_x, echo_y = x+sensor_x+px, y+sensor_y+py
+                    key = cell(echo_x,echo_y)
                     along_x, along_y = surfaces.get(key,(False,False))
                     if along_x == along_y:
                         continue
                     cx, cy = midpoint(key)
                     if along_x and abs(py) >= abs(px)/3:
                         horizontal.add(key)
-                        residual += abs(y+py-cy)
+                        residual += abs(echo_y-cy)
                     elif along_y and abs(px) >= abs(py)/3:
                         vertical.add(key)
-                        residual += abs(x+px-cx)
+                        residual += abs(echo_x-cx)
                 if min(len(horizontal),len(vertical)) < 2:
                     continue
                 rank = (len(horizontal)+len(vertical), -residual-abs(da)*.3-math.hypot(dx,dy)*.25)
@@ -423,8 +426,14 @@ class MapaAutomatico(Map):
         x,y,sector = self.chave_direcao(heading)
         return any((x,y,(sector+offset)%12) in self.blocked for offset in (-1,0,1))
 
+    def sonar_origin(self, pose):
+        dx,dy = relative(90, self.profile.sensor_forward, pose.heading)
+        return pose.x+dx, pose.y+dy
+
     def scan(self, points):
-        corrected = reconhecer_pose(self.cells,self.pose,points) if self.has_scan and not self.stationary_reference else None
+        corrected = None
+        if self.has_scan and not self.stationary_reference:
+            corrected = reconhecer_pose(self.cells, self.pose, points, self.profile.sensor_forward)
         self.localized = self.stationary_reference or corrected is not None
         if corrected:
             self.stationary_reference = True
@@ -437,10 +446,11 @@ class MapaAutomatico(Map):
         self.quick_hits.clear()
         self.quick_free.clear()
         hits, free = set(), set()
+        sensor_x, sensor_y = self.sonar_origin(pose)
         for angle, cm in returns(points):
             dx,dy = relative(angle,cm,pose.heading)
-            hits.add(cell(pose.x+dx,pose.y+dy))
-            free.update(ray_cells(pose.x,pose.y,dx,dy,CELL))
+            hits.add(cell(sensor_x+dx,sensor_y+dy))
+            free.update(ray_cells(sensor_x,sensor_y,dx,dy,CELL))
         if self.has_scan and not self.localized:
             # Na mesma pose, uma célula que bloqueou a manobra só perde
             # o veto provisório quando um feixe válido passa além dela.
@@ -478,7 +488,7 @@ class MapaAutomatico(Map):
         if missing_angles:
             for key in self.tentative | {k for k,v in self.cells.items() if v == OCCUPIED}:
                 x,y = midpoint(key)
-                dx,dy = x-pose.x,y-pose.y
+                dx,dy = x-sensor_x,y-sensor_y
                 if math.hypot(dx,dy) <= 400:
                     heading = math.degrees(math.atan2(dx,dy))
                     angle = 90 + delta(heading,pose.heading)
@@ -502,10 +512,11 @@ class MapaAutomatico(Map):
         self.quick_hits.clear()
         self.quick_free.clear()
         seen_beyond = set()
+        sensor_x, sensor_y = self.sonar_origin(pose)
         for angle, cm in returns(points):
             dx,dy = relative(angle,cm,pose.heading)
-            self.quick_hits.add(cell(pose.x+dx,pose.y+dy))
-            seen_beyond.update(ray_cells(pose.x,pose.y,dx,dy,CELL))
+            self.quick_hits.add(cell(sensor_x+dx,sensor_y+dy))
+            seen_beyond.update(ray_cells(sensor_x,sensor_y,dx,dy,CELL))
         if self.stationary_reference or self.tentative_reference == pose:
             free = seen_beyond - self.quick_hits
             self.quick_free = {key for key in free if self.cells.get(key) != OCCUPIED}
@@ -754,7 +765,7 @@ class MapaAutomatico(Map):
         path = Path(path)
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps({
-            "version": 2,"pose": asdict(self.pose),"trail": [asdict(p) for p in self.trail],
+            "version": 2,"profile": asdict(self.profile),"pose": asdict(self.pose),"trail": [asdict(p) for p in self.trail],
             "cells": [[*key,value] for key,value in sorted(self.cells.items())],
             "tentative": sorted(self.tentative),"passages": list(self.passages.values()),
             "clearing": [[*key,value] for key,value in self.clearing.items()],
@@ -764,7 +775,7 @@ class MapaAutomatico(Map):
 
     @classmethod
     def from_data(cls,data):
-        result = cls()
+        result = cls(PerfilAutomatico(**data.get("profile", {})))
         result.stationary_reference = False
         result.pose = Pose(**data["pose"])
         result.trail = [Pose(**p) for p in data["trail"]]

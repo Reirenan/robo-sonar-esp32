@@ -8,8 +8,11 @@ from tkinter import filedialog, messagebox, ttk
 
 from Abrir_supervisorio import SerialBridge
 from ControleAutonomo import Navigator
-from Navegacao import CELL, FREE, Map, MapaAutomatico, OCCUPIED, midpoint, relative
+from Navegacao import CELL, FREE, Map, MapaAutomatico, OCCUPIED, PerfilAutomatico, midpoint, relative
 
+# O sonar fica na ponta do chassi de 30 cm. Os 12 cm são uma
+# estimativa inicial entre o centro de giro e o eixo vertical do servo.
+PERFIL_MONTAGEM = PerfilAutomatico(sensor_forward=12)
 SESSION = Path(__file__).resolve().with_name("mapa-sessao.json")
 
 
@@ -74,7 +77,7 @@ class Panel:
         if self.busy():
             return
         self.viewport = None
-        self.map = MapaAutomatico()
+        self.map = MapaAutomatico(PERFIL_MONTAGEM)
         self.render_directions()
         self.target = SESSION
         self.start_worker(self.run, self.map)
@@ -246,10 +249,11 @@ class Panel:
         selection = getattr(m, "selected_gap", None)
         if selection:
             pose, gap = selection
-            start = xy(pose.x, pose.y)
+            sensor_x, sensor_y = m.sonar_origin(pose)
+            start = xy(sensor_x, sensor_y)
             for angle in (gap.first, gap.center, gap.last):
                 dx,dy = relative(angle, min(gap.depth, 100), pose.heading)
-                end = xy(pose.x + dx, pose.y + dy)
+                end = xy(sensor_x + dx, sensor_y + dy)
                 if angle == gap.center:
                     c.create_line(*start, *end, fill="#5ce4ea", width=3, arrow="last")
                 else:
