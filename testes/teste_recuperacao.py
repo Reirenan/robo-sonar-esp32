@@ -2,7 +2,7 @@ import unittest
 from threading import Event
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from ControleAutonomo import Navigator
 from Navegacao import FREE, Map, MapaAutomatico, OCCUPIED, PerfilAutomatico, Pose
 
@@ -264,3 +264,62 @@ class RecuperacaoTest(unittest.TestCase):
         with patch.object(nav, "move", return_value=True) as move:
             self.assertTrue(nav.decision(22.6, allow_turn=True))
         move.assert_called_once_with("l", 5, 100)
+
+    def test_sondagem_curta_confirma_eco_frontal_inconclusivo(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None, mapa, Event(), lambda _: None)
+        points = [(30, 21.7), (60, 22.3), (90, None), (120, 63), (150, 61.1)]
+        state = {"scanKind": "quick", "angle": 90, "points": points}
+        with patch.object(nav, "command"), patch.object(nav, "wait_for", return_value=state), \
+             patch.object(nav, "front_probe", return_value=65) as probe:
+            self.assertEqual(nav.quick_observe(), 65)
+        probe.assert_called_once_with(sample_count=5)
+        self.assertEqual(nav.scan_points, points)
+        self.assertFalse(mapa.clearing)
+
+    def test_confirmacao_frontal_exige_consenso_e_preserva_o_eco_proximo(self):
+        bridge = Mock()
+        stop = Mock()
+        stop.is_set.return_value = stop.wait.return_value = False
+        nav = Navigator(bridge, MapaAutomatico(), stop, lambda _: None)
+        for samples, expected in [
+            ([55, 64, 65, 66, 58], 64.5),
+            ([55, 65, 85], None),
+            ([65, 64, 42, 66, 65], 42),
+            ([65, 0, 0, 64, 0], None),
+        ]:
+            with self.subTest(samples=samples):
+                bridge.request.side_effect = [
+                    (200, {"angle": 90, "pulseUs": round(cm / .01715)}) for cm in samples
+                ]
+                with patch.object(nav, "command", return_value={"angle": 90, "motorBusy": False}):
+                    value = nav.front_probe(sample_count=len(samples))
+                if expected is None:
+                    self.assertIsNone(value)
+                else:
+                    self.assertAlmostEqual(value, expected, delta=.03)
+
+    def test_dois_giros_curtos_nao_esgotam_o_limite_de_varredura(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None, mapa, Event(), lambda _: None)
+        with patch.object(nav, "command"), patch.object(nav, "wait_for",
+                side_effect=[{"autoElapsedMs": 50, "autoEnd": "t"}] * 2):
+            self.assertTrue(nav.move("l", 5, 100))
+            self.assertTrue(nav.move("r", 5, 100))
+        self.assertEqual(nav.turn_budget_used, 1)
+        self.assertLess(nav.turn_budget_used, nav.scan_budget()[1])
+
+    def test_localizacao_apos_giro_mantem_centro_ate_haver_tracao_linear(self):
+        mapa = MapaAutomatico(PerfilAutomatico(sensor_forward=12))
+        points = [(90, 50)]
+        mapa.scan(points)
+        mapa.integrate("l", 50)
+        with patch("Navegacao.reconhecer_pose", return_value=None) as recognize:
+            mapa.scan(points)
+            recognize.assert_called_once_with(mapa.cells, Pose(0, 0, 355), points, 12,
+                                              allow_translation=False)
+        mapa.integrate("f", 200)
+        with patch("Navegacao.reconhecer_pose", return_value=None) as recognize:
+            pose = mapa.pose
+            mapa.scan(points)
+            recognize.assert_called_once_with(mapa.cells, pose, points, 12, allow_translation=True)

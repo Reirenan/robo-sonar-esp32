@@ -345,7 +345,7 @@ class PerfilAutomatico:
         return math.hypot(self.robot_width, self.robot_length) / 2 + MARGIN
 
 
-def reconhecer_pose(cells, predicted, points, sensor_forward=0):
+def reconhecer_pose(cells, predicted, points, sensor_forward=0, *, allow_translation=True):
     """Procura ecos repetidos em dois alinhamentos diferentes do mapa."""
     references = {k for k, value in cells.items() if value == OCCUPIED}
     surfaces = {
@@ -358,12 +358,15 @@ def reconhecer_pose(cells, predicted, points, sensor_forward=0):
         return None
 
     best = None
+    # Se houve apenas giro desde a última referência, o ajuste pode
+    # corrigir o rumo, mas mantém o centro do chassi no lugar.
+    offsets = (0,-5,5,-10,10) if allow_translation else (0,)
     for da in (0,-5,5,-10,10):
         heading = (predicted.heading + da) % 360
         projected = [relative(a,d,heading) for a,d in samples]
         sensor_x, sensor_y = relative(90, sensor_forward, heading)
-        for dx in (0,-5,5,-10,10):
-            for dy in (0,-5,5,-10,10):
+        for dx in offsets:
+            for dy in offsets:
                 x, y = predicted.x+dx, predicted.y+dy
                 horizontal, vertical = set(), set()
                 residual = 0
@@ -401,6 +404,7 @@ class MapaAutomatico(Map):
         # A origem é conhecida até o primeiro pulso. O repouso, por si só,
         # nunca valida uma pose que já estava incerta antes da parada.
         self.stationary_reference = True
+        self.translated_since_reference = False
         self.awaiting_echo = set()
         self.directions = {}
         self.quick_hits = set()
@@ -433,10 +437,12 @@ class MapaAutomatico(Map):
     def scan(self, points):
         corrected = None
         if self.has_scan and not self.stationary_reference:
-            corrected = reconhecer_pose(self.cells, self.pose, points, self.profile.sensor_forward)
+            corrected = reconhecer_pose(self.cells, self.pose, points, self.profile.sensor_forward,
+                                       allow_translation=self.translated_since_reference)
         self.localized = self.stationary_reference or corrected is not None
         if corrected:
             self.stationary_reference = True
+            self.translated_since_reference = False
             self.pose = corrected
             self.uncertainty = 0
             if len(self.trail) > 1:
@@ -748,6 +754,7 @@ class MapaAutomatico(Map):
         super().integrate(direction,elapsed_ms)
         after = self.pose
         self.stationary_reference = False
+        self.translated_since_reference |= after.x != before.x or after.y != before.y
         self.tentative_reference = None
         self.quick_free.clear()
         self.uncertainty += (math.hypot(after.x-before.x,after.y-before.y)*.06

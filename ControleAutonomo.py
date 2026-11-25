@@ -60,7 +60,7 @@ class Navigator:
         self.survey_turns = Counter()
         self.survey_turn_pending = False
         self.since_scan = 0.0
-        self.turns_since_scan = 0
+        self.turn_budget_used = 0
         self.last_direction = None
         self.reverse_limit = 0
         self.rear_origin = None
@@ -118,7 +118,7 @@ class Navigator:
         self.scan_kind = "full"
         self.side_readings_current = True
         self.since_scan = 0.0
-        self.turns_since_scan = 0
+        self.turn_budget_used = 0
         self.valid_scan = any(returns(self.scan_points))
         self.map.scan(state["points"])
         summary = "Posição de referência confirmada" if self.map.localized else "Posição estimada"
@@ -140,7 +140,13 @@ class Navigator:
         self.scan_kind = "quick"
         self.side_readings_current = True
         self.map.quick_observation(points)
-        return dict(points).get(90)
+        front = dict(points).get(90)
+        if front is None:
+            # A sondagem usa três amostras por ponto. Se elas discordam,
+            # confirma só a frente com o servo já parado em 90°.
+            self.notify("Confirmando eco frontal · rodas paradas")
+            return self.front_probe(sample_count=5)
+        return front
 
     def move(self, direction, amount, rate):
         # O pulso é indivisível na placa e limitado a 350 ms. Após cada pulso,
@@ -171,7 +177,10 @@ class Navigator:
                     self.rear_origin, self.rear_heading = before, before.heading
                 self.forward_at = time.monotonic()
             elif direction in {"l","r"}:
-                self.turns_since_scan += 1
+                # Uma rotação de 25° consome uma unidade. Giros curtos
+                # consomem pelo menos meia unidade para limitar as tentativas.
+                degrees = abs(delta(self.map.pose.heading, before.heading))
+                self.turn_budget_used += max(.5, degrees/25)
                 # Um giro no lugar conserva o trecho percorrido. A ré só
                 # volta a ser elegível se o rumo se realinhar com esse trecho.
         if self.automatic and direction == "f" and outcome in {"e","o"}:
@@ -189,14 +198,14 @@ class Navigator:
             self.notify("Obstáculo frontal. Rodas paradas")
         return bool(elapsed) or outcome == "o"
 
-    def front_probe(self):
+    def front_probe(self, sample_count=3):
         # O comando echo é diagnóstico e não cria sessão. Primeiro confirma
         # a concessão USB e a posição física comandada, com rodas já paradas.
         state = self.command("state")
         if state["angle"] != 90 or state["motorBusy"]:
             return None
         samples = []
-        for _ in range(3):
+        for _ in range(sample_count):
             self.check_stop()
             code, data = self.bridge.request("echo")
             if code != 200:
@@ -209,9 +218,16 @@ class Navigator:
         # Uma leitura próxima tem precedência sobre as demais.
         if any(cm <= 45 for cm in samples):
             return min(samples)
-        # A leitura rápida serve de veto e liberação local, sem atualizar
-        # a ocupação nem contar como uma confirmação de remoção do mapa.
-        return median(samples) if len(samples) == 3 else None
+        if len(samples) < 3:
+            return None
+        # O filtro exige três ecos que concordem, aplicando a mesma
+        # tolerância de 5 cm ou 10% usada na varredura pela ESP32.
+        center = median(samples)
+        tolerance = max(5, center * .10)
+        agreeing = [cm for cm in samples if abs(cm - center) <= tolerance]
+        # Esta leitura autoriza avaliar a manobra local. Ela não altera
+        # ocupação nem conta como confirmação de remoção do mapa.
+        return median(agreeing) if len(agreeing) >= 3 else None
 
     def turn_key(self, degrees):
         pose = self.map.pose
@@ -555,8 +571,9 @@ class Navigator:
                         break
                     distance_budget, turn_budget = self.scan_budget()
                     if (self.since_scan >= distance_budget-self.map.arena.speed*.040
-                            or self.turns_since_scan >= turn_budget):
-                        self.notify("Atualizando mapa · limite de distância ou giros atingido")
+                            or self.turn_budget_used >= turn_budget):
+                        reason = "distância percorrida" if self.turn_budget_used < turn_budget else "giros acumulados"
+                        self.notify(f"Atualizando mapa · limite de {reason}")
                         break
                     if self.map.frontier_target is not None:
                         if cell(self.map.pose.x,self.map.pose.y) == self.map.frontier_target:
