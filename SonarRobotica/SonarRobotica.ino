@@ -29,7 +29,7 @@ constexpr uint32_t FIRST_SETTLE_MS = 700, SERVO_STEP_MS = 45, STEP_SETTLE_MS = 3
 constexpr uint8_t SAMPLES_PER_POINT = 5, MIN_AGREEING_SAMPLES = 3;
 constexpr uint8_t QUICK_FIRST = 30, QUICK_LAST = 150, QUICK_ANGLE_STEP = 30;
 constexpr uint8_t QUICK_POINTS = 5, QUICK_SAMPLES = 3;
-constexpr uint8_t QUICK_SERVO_STEP_DEG = 3;
+constexpr uint8_t FAST_SERVO_STEP_DEG = 3;
 constexpr uint32_t QUICK_SERVO_STEP_MS = 45, QUICK_SETTLE_MS = 220;
 constexpr char AP_NAME[] = "Robo-Sonar";
 constexpr char AP_PASSWORD[] = "sonar-2026";
@@ -69,6 +69,7 @@ uint8_t tries = 0, validCount = 0;
 float validSamples[SAMPLES_PER_POINT];
 uint8_t scanTarget = HOME_ANGLE;
 bool quickScan = false;
+bool fastServoSweep = false;
 uint8_t scanEchoes = 0, scanValidEchoes = 0;
 uint32_t pingAt = 0;
 uint32_t advanceStartedAt = 0;
@@ -254,8 +255,11 @@ void updateAuto() {
   }
 }
 
-void startScan(bool quick) {
+void startScan(bool quick, bool autonomous = false) {
   quickScan = quick;
+  // Na busca USB, só aceleramos o deslocamento entre ângulos. A leitura
+  // completa mantém 19 posições, cinco ecos e o mesmo tempo de acomodação.
+  fastServoSweep = quick || autonomous;
   count = 0;
   scanEchoes = 0;
   scanValidEchoes = 0;
@@ -355,12 +359,12 @@ void updateScan() {
     if (angle != scanTarget) {
       const uint32_t startedAt = millis();
       const int remaining = int(scanTarget) - int(angle);
-      const int distance = min(abs(remaining), quickScan ? int(QUICK_SERVO_STEP_DEG) : 1);
+      const int distance = min(abs(remaining), fastServoSweep ? int(FAST_SERVO_STEP_DEG) : 1);
       const uint8_t next = angle + (remaining > 0 ? distance : -distance);
       if (setAngle(next)) {
         // Usar o início do passo evita somar a latência do GPIO ao intervalo.
         // A acomodação final sempre conta a partir da última escrita no PWM.
-        const uint32_t base = quickScan && angle != scanTarget ? startedAt : millis();
+        const uint32_t base = fastServoSweep && angle != scanTarget ? startedAt : millis();
         pingAt = base + scanDelay();
       }
       return;
@@ -491,7 +495,7 @@ void sendState() {
   server.send(200, "application/json", buildState());
 }
 
-int applyCommand(const String& action, const char*& error) {
+int applyCommand(const String& action, const char*& error, bool fromUsb = false) {
   if (action == "stop") {
     autoActive = false;
     if (autoDirection) {
@@ -517,7 +521,7 @@ int applyCommand(const String& action, const char*& error) {
     stopMotors();
     frontCm = -1.0f;
     advanceEnd = AdvanceEnd::none;
-    startScan(false);
+    startScan(false, fromUsb && autoActive);
   } else if (action == "advance") {
     if (activityRunning() || motorBusy(true) || !motorReady || !servoReady) {
       error = "Avanço indisponível. Confira o servo e aguarde o robô parar.";
@@ -615,7 +619,7 @@ void handleUsbRequest(const char* line) {
   } else if (strncmp(action, "auto_", 5) == 0) {
     status = startAuto(action, error);
   } else if (strcmp(action, "state") != 0) {
-    status = applyCommand(action, error);
+    status = applyCommand(action, error, true);
   }
   Serial.printf("@%lu %d ", id, status);
   if (status == 200) Serial.println(buildState());

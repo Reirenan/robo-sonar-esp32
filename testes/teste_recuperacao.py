@@ -146,3 +146,22 @@ class RecuperacaoTest(unittest.TestCase):
              patch.object(nav, "move", return_value=True) as move:
             self.assertTrue(nav.pursue_frontier(80, allow_turn=True))
         move.assert_called_once_with("f", 8.75, 25)
+
+    def test_varredura_informa_progresso_e_retorno_ao_centro(self):
+        msgs = []
+        nav = Navigator(None, MapaAutomatico(), Event(), msgs.append)
+        points = [(a, 80) for a in range(0, 181, 10)]
+
+        def wait_for(check, timeout):
+            self.assertFalse(check({"state": "running", "points": points[:4]}))
+            self.assertFalse(check({"state": "running", "points": points[:4]}))
+            self.assertFalse(check({"state": "returning", "points": points}))
+            state = {"state": "done", "points": points}
+            self.assertTrue(check(state))
+            return state
+
+        with patch.object(nav, "command"), patch.object(nav, "wait_for", side_effect=wait_for):
+            nav.observe()
+        self.assertEqual(sum("4/19" in msg for msg in msgs), 1)
+        self.assertTrue(any("voltando ao centro" in msg for msg in msgs))
+        self.assertEqual(nav.scan_points, points)

@@ -100,7 +100,20 @@ class Navigator:
     def observe(self):
         self.notify("Atualizando mapa · rodas paradas")
         self.command("start")
-        state = self.wait_for(lambda s: s["state"] == "done", 45)
+        reported = 0
+
+        def scan_finished(state):
+            nonlocal reported
+            if state["state"] == "done":
+                return True
+            count = len(state.get("points", ()))
+            if count > reported and (count - reported >= 4 or count == 19):
+                reported = count
+                status = "Sensor voltando ao centro" if count == 19 else f"Varredura · {count}/19 ângulos"
+                self.notify(status + " · rodas paradas")
+            return False
+
+        state = self.wait_for(scan_finished, 45)
         self.scan_points = state["points"]
         self.scan_kind = "full"
         self.side_readings_current = True
