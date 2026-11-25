@@ -435,11 +435,9 @@ class Navigator:
     def pursue_frontier(self, front, allow_turn, replan=True):
         """Executa um trecho da rota e pede desvio apenas se ela bloquear."""
         m = self.map
-        if m.frontier_target is None:
+        if m.frontier_target is None or not m.frontier_path:
             return self.decision(front,allow_turn)
         pose = m.pose
-        if not m.frontier_path:
-            return False
         if m.uncertainty > 30:
             self.wait_reason = "Posição incerta · aguardando varredura"
             return False
@@ -450,7 +448,7 @@ class Navigator:
         m.selected_direction = None
         m.maneuver_blockers = {}
         m.directions["f"] = (front,"Via planejada" if front is not None and front > 45 else "Aguardando eco livre")
-        if abs(turn) > 12:
+        if abs(turn) > 12 and allow_turn:
             rate = m.arena.left_rate if turn < 0 else m.arena.right_rate
             for size in dict.fromkeys((min(abs(turn),25),15,10,5)):
                 if size > abs(turn) or size / rate < .040:
@@ -463,19 +461,20 @@ class Navigator:
                     self.notify("Alinhando para seguir a rota")
                     if self.turn(rotation):
                         return True
-        elif front is not None and front > 45:
+        elif abs(turn) <= 12 and front is not None and front > 45:
             step = min(math.hypot(dx,dy),m.arena.speed*.350,self.scan_budget()[0]-self.since_scan)
             if step >= m.arena.speed*.040 and m.swept_clear(distance=step):
                 m.selected_direction = "f"
                 known = any(visit[:2] == cell(*waypoint) for visit in m.visited)
                 self.notify("Voltando por caminho conhecido" if known else "Indo para uma nova área")
-                if self.move("f",step,m.arena.speed):
-                    return True
+                # Se a ESP32 vetar o pulso, a frente precisa ser medida
+                # novamente antes de tentar outro avanço.
+                return self.move("f",step,m.arena.speed)
 
         if not allow_turn:
             return False
         if not replan:
-            return self.decision(None,allow_turn=True)
+            return self.decision(front,allow_turn=True)
         # Uma aresta rejeitada volta a ser elegível se a região mudar.
         origin,destination = cell(pose.x,pose.y),cell(*waypoint)
         self.blocked_edges[origin,destination] = (m.frontier_signature(origin),m.frontier_signature(destination))
@@ -483,15 +482,13 @@ class Navigator:
         if m.frontier_path and m.frontier_path[0] != waypoint:
             self.notify("Rota recalculada · seguindo pela área conhecida")
             return self.pursue_frontier(front,allow_turn=True,replan=False)
-        return self.decision(None,allow_turn=True)
+        return self.decision(front,allow_turn=True)
 
     def explore(self):
         while True:
             self.observe()
             self.plan_frontier()
             front = dict(self.scan_points).get(90)
-            if self.map.frontier_target is not None and not self.map.frontier_path:
-                continue
             moved = self.pursue_frontier(front,allow_turn=True)
             if not moved and self.quick_supported and any(self.map.maneuver_blockers.values()):
                 self.notify("Reavaliando a margem da manobra")

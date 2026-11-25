@@ -115,3 +115,34 @@ class RecuperacaoTest(unittest.TestCase):
             self.assertTrue(nav.pursue_frontier(80,allow_turn=True))
         plan.assert_called_once()
         move.assert_called_once_with("f",8.75,25)
+
+    def test_rota_sem_trecho_ainda_permite_avanco_local_com_eco(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None, mapa, Event(), lambda _: None)
+        mapa.frontier_target = (0, 2)
+        with patch.object(mapa, "swept_blockers", return_value=set()), \
+             patch.object(nav, "move", return_value=True) as move:
+            self.assertTrue(nav.pursue_frontier(80, allow_turn=True))
+        move.assert_called_once_with("f", 8.75, 25)
+
+    def test_rota_lateral_sem_giro_permitido_nao_move_robo(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None, mapa, Event(), lambda _: None)
+        mapa.frontier_target = (2, 0)
+        mapa.frontier_path = [(10, 0)]
+        with patch.object(mapa, "swept_clear", return_value=True), \
+             patch.object(nav, "move") as move:
+            self.assertFalse(nav.pursue_frontier(80, allow_turn=False))
+        move.assert_not_called()
+
+    def test_rota_lateral_bloqueada_reaproveita_eco_frontal_na_decisao_local(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None, mapa, Event(), lambda _: None)
+        mapa.frontier_target = (2, 0)
+        mapa.frontier_path = [(10, 0)]
+        with patch.object(mapa, "swept_clear", return_value=False), \
+             patch.object(mapa, "swept_blockers", return_value=set()), \
+             patch.object(nav, "plan_frontier"), \
+             patch.object(nav, "move", return_value=True) as move:
+            self.assertTrue(nav.pursue_frontier(80, allow_turn=True))
+        move.assert_called_once_with("f", 8.75, 25)
