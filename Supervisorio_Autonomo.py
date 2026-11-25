@@ -37,6 +37,20 @@ class Panel:
         self.stop_button.pack(side="left",padx=(0,6))
         self.open_button = ttk.Button(toolbar,text="Abrir mapa",command=self.open_map)
         self.open_button.pack(side="right")
+        self.cards = {}
+        strip = tk.Frame(body,bg="#e8edf2")
+        strip.pack(fill="x",pady=(12,0))
+        for column,(direction,label) in enumerate((("l","ESQUERDA"),("f","FRENTE"),("r","DIREITA"))):
+            strip.columnconfigure(column,weight=1,uniform="direcoes")
+            card = tk.Frame(strip,bg="#f5f8fb",padx=12,pady=8)
+            card.grid(row=0,column=column,sticky="nsew",padx=(0 if column==0 else 4,0))
+            title = tk.Label(card,text=label,bg="#f5f8fb",fg="#415568",font=("Segoe UI",9,"bold"),anchor="w")
+            value = tk.Label(card,text="—",bg="#f5f8fb",fg="#112838",font=("Segoe UI",19,"bold"),anchor="w")
+            reason = tk.Label(card,text="Aguardando leitura",bg="#f5f8fb",fg="#415568",anchor="w",justify="left")
+            for widget in (title,value,reason):
+                widget.pack(fill="x")
+            self.cards[direction] = card,title,value,reason
+
         self.status = ttk.Label(body,text="Pronto. Posicione o robô em área livre antes de iniciar.",
                                 wraplength=760,padding=(0,9))
         self.status.pack(fill="x")
@@ -61,6 +75,7 @@ class Panel:
             return
         self.viewport = None
         self.map = MapaAutomatico()
+        self.render_directions()
         self.target = SESSION
         self.start_worker(self.run, self.map)
 
@@ -98,6 +113,8 @@ class Panel:
         result.tentative = set(model.tentative)
         result.clearing = dict(model.clearing)
         result.awaiting_echo = set(model.awaiting_echo)
+        result.directions = dict(model.directions)
+        result.selected_direction = model.selected_direction
         result.localized = model.localized
         result.passages = {key: value.copy() for key,value in model.passages.items()}
         return result
@@ -107,6 +124,7 @@ class Panel:
             while True:
                 message, self.map, done = self.events.get_nowait()
                 self.status.configure(text=message)
+                self.render_directions()
                 self.draw()
                 if done:
                     self.thread = None
@@ -121,6 +139,7 @@ class Panel:
         try:
             self.map = Map.load(path)
             self.viewport = None
+            self.render_directions()
             self.status.configure(text="Mapa salvo carregado. Para iniciar outra exploração, reposicione o robô na origem.")
             self.draw()
         except (OSError, ValueError, TypeError, KeyError) as error:
@@ -130,6 +149,18 @@ class Panel:
         path = filedialog.askopenfilename(filetypes=[("Mapa JSON", "*.json")])
         if path:
             self.read_map(path)
+
+    def render_directions(self):
+        readings = getattr(self.map,"directions",{})
+        selected = getattr(self.map,"selected_direction",None)
+        for direction,(frame,title,value,reason) in self.cards.items():
+            distance,label = readings.get(direction,(None,"Aguardando leitura"))
+            active = selected == direction
+            background = "#d2efe4" if active else "#f5f8fb"
+            for widget in (frame,title,value,reason):
+                widget.configure(bg=background)
+            value.configure(text="—" if distance is None else f"{distance:.0f} cm")
+            reason.configure(text=("Escolhida · " if active else "")+label)
 
     def draw(self):
         c, m = self.canvas, self.map

@@ -62,7 +62,7 @@ Alimente o SG90 e o HC-SR04 com 5 V regulados e compartilhe o GND com a ESP32 e 
 ### Movimento e segurança
 
 - O perfil interno pressupõe um chassi de **25 × 30 cm**, velocidade de **25 cm/s** e giros de **100°/s**. São referências conservadoras de software e a escala é estimada. Se o chassi real for maior, ajuste o perfil em `Navegacao.py` antes de usar a autonomia.
-- O robô alterna pulsos de tração de até **350 ms** com varreduras paradas. Ao avançar, a ESP32 corta a tração se detectar um obstáculo a **45 cm ou menos**, ou se o sonar deixar de receber eco. O corte de tempo e a perda do vínculo USB também são tratados pela placa.
+- O robô avança em pulsos de até **350 ms** e confere a frente entre eles. Faz varredura completa ao ligar a exploração, ao bloquear e a cada **25 cm estimados**. Se a frente fechar, tenta esquerda e depois direita. Os giros no lugar usam PWM **175/180**, em sentidos opostos, e conferem a área varrida pelo retângulo do chassi. Ao avançar, a ESP32 corta a tração se detectar um obstáculo a **45 cm ou menos**, ou se o sonar deixar de receber eco. O corte de tempo e a perda do vínculo USB também são tratados pela placa.
 - O planejador prioriza fronteiras e usa células livres para retornar a uma área com outras direções possíveis. Se cair numa situação sem passagem observável, mantém as rodas paradas, informa **Aguardando passagem segura** e volta a medir. Uma queda da COM3 encerra a sessão.
 - Uma passagem provável precisa de bordas observadas e de folga medível dos dois lados. Sem delimitar o perímetro, o sonar não consegue garantir que a passagem é a saída da arena. A marca some após duas varreduras válidas além dela. Com o robô imóvel, vale a última posição confiável. Depois de mover as rodas, o sonar precisa reconhecer a posição novamente. Âmbar com **1/2** indica a primeira confirmação. Uma marca sem retorno correspondente continua aguardando confirmação.
 
@@ -75,3 +75,5 @@ O estado serial inclui `reverseMaxMs` e `rawPulses`. Os cinco pulsos brutos em m
 ### Testes
 
 Execute `python -B -m unittest discover -s testes -p "teste_*.py" -v`. Os testes reproduzem orientação, persistência, cancelamento, perda de comunicação, busca e remoção de obstáculos. No robô, valide também o curso do servo, a folga de giro e a distância de parada com rodas no piso. As medidas e o comportamento físico dependem da montagem.
+
+As três leituras no topo indicam o motivo da decisão; o cartão verde marca a direção escolhida. O sonar frontal continua sendo o veto de avanço em tempo real.

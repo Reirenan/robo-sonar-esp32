@@ -1,6 +1,7 @@
 """Ciclo da exploração. O despacho serial fica em uma única thread do painel."""
 import math
 import time
+from statistics import median
 
 from Navegacao import MapaAutomatico, cell, delta, relative, returns
 
@@ -18,6 +19,10 @@ class Navigator:
         self.owns_session = False
         self.automatic = isinstance(arena_map, MapaAutomatico)
         self.valid_scan = False
+        self.scan_points = []
+        self.side_readings_current = False
+        self.since_scan = 0.0
+        self.last_direction = None
         self.reverse_limit = 0
         self.rear_origin = None
         self.rear_heading = None
@@ -53,7 +58,10 @@ class Navigator:
         self.notify("Varrendo a arena com as rodas paradas")
         self.command("start")
         state = self.wait_for(lambda s: s["state"] == "done", 45)
-        self.valid_scan = any(returns(state["points"]))
+        self.scan_points = state["points"]
+        self.side_readings_current = True
+        self.since_scan = 0.0
+        self.valid_scan = any(returns(self.scan_points))
         self.map.scan(state["points"])
         summary = "Posição de referência confirmada" if self.map.localized else "Posição estimada"
         if self.map.clearing:
@@ -75,8 +83,11 @@ class Navigator:
         self.command(f"auto_{direction}_{duration}")
         state = self.wait_for(lambda s: not s["motorBusy"], 4)
         elapsed = state["autoElapsedMs"]
+        self.last_direction = direction if elapsed else None
         if elapsed:
             self.map.integrate(direction, elapsed)
+            if direction == "f":
+                self.since_scan += elapsed * rate / 1000
         outcome = state["autoEnd"]
         if self.automatic and elapsed:
             if direction == "f":
@@ -86,6 +97,7 @@ class Navigator:
                 self.forward_at = time.monotonic()
             elif direction in {"l","r"}:
                 self.rear_origin = None
+                self.side_readings_current = False
         if self.automatic and direction == "f" and outcome in {"e","o"}:
             self.map.blocked.add(self.map.chave_direcao(self.map.pose.heading))
             self.wait_reason = ("Sem eco frontal" if outcome == "e" else "Obstáculo frontal")
@@ -100,6 +112,81 @@ class Navigator:
         if outcome == "o":
             self.notify("Obstáculo frontal. Rodas paradas")
         return bool(elapsed) or outcome == "o"
+
+    def front_probe(self):
+        # O comando echo é diagnóstico e não cria sessão. Primeiro confirma
+        # a concessão USB e a posição física comandada, com rodas já paradas.
+        state = self.command("state")
+        if state["angle"] != 90 or state["motorBusy"]:
+            return None
+        samples = []
+        for _ in range(3):
+            self.check_stop()
+            code, data = self.bridge.request("echo")
+            if code != 200:
+                raise RuntimeError(data)
+            cm = data["pulseUs"] * .0343 / 2
+            if data["angle"] == 90 and 2 <= cm <= 400:
+                samples.append(cm)
+            if self.interrupt.wait(.07):
+                raise StopRequested
+        # Uma leitura próxima tem precedência sobre as demais.
+        if any(cm <= 45 for cm in samples):
+            return min(samples)
+        # A leitura rápida serve de veto e liberação local, sem atualizar
+        # a ocupação nem contar como uma confirmação de remoção do mapa.
+        return median(samples) if len(samples) == 3 else None
+
+    def available_turn(self, sign):
+        if not self.side_readings_current:
+            return None,0,"Aguardando varredura no novo rumo"
+        points = dict(self.scan_points)
+        # Uma abertura precisa aparecer em dois feixes vizinhos. O menor
+        # retorno determina a folga da direção pretendida.
+        options = []
+        for offset in (40,50,60,70):
+            angle = 90 + sign*offset
+            distances = [points.get(angle),points.get(angle-sign*10)]
+            if all(value is not None and value > 45 for value in distances):
+                options.append((min(distances),sign*min(offset,25)))
+        if not options:
+            sector = [points.get(90+sign*offset) for offset in range(30,71,10)]
+            valid = [value for value in sector if value is not None]
+            return (min(valid),0,"Passagem lateral sem folga") if valid else (None,0,"Sem eco lateral")
+        distance,turn = max(options)
+        target = self.map.pose.heading + sign*45
+        if self.map.direction_blocked(target):
+            return distance,0,"Direção bloqueada na última tentativa"
+        if not self.map.swept_clear(turn=turn):
+            return distance,0,"Chassi sem folga no giro"
+        return distance,turn,"Giro disponível"
+
+    def decision(self, front, allow_turn):
+        m = self.map
+        m.selected_direction = None
+        step = min(m.arena.speed*.350,25-self.since_scan)
+        forward = front is not None and front > 45 and step >= m.arena.speed*.040
+        forward = forward and m.swept_clear(distance=step) and m.uncertainty <= 30
+        left,lt,lreason = self.available_turn(-1)
+        right,rt,rreason = self.available_turn(1)
+        freason = ("Sem eco confiável" if front is None else "Obstáculo até 45 cm"
+                   if front <= 45 else "Passagem livre" if forward else "Faixa sem folga confirmada")
+        m.directions = {"l": (left,lreason), "f": (front,freason), "r": (right,rreason)}
+        if forward:
+            m.selected_direction = "f"
+            return self.move("f",step,m.arena.speed)
+        if not allow_turn:
+            return False
+        if m.uncertainty <= 30:
+            for direction,turn in (("l",lt),("r",rt)):
+                if turn:
+                    m.selected_direction = direction
+                    if self.turn(turn):
+                        return True
+            if self.backtrack():
+                return True
+        self.wait_reason = "Posição incerta" if m.uncertainty > 30 else freason + " · sem manobra com folga"
+        return False
 
     def next_move(self):
         m, a = self.map, self.map.arena
@@ -166,28 +253,37 @@ class Navigator:
             bx,by = relative(90,-min(cm,step),pose.heading)
             if not m.clear_reverse_body(pose.x+bx,pose.y+by):
                 return False
+        m.selected_direction = "b"
         return self.move("b",step,m.arena.speed)
 
     def turn(self, degrees):
         m = self.map
-        if not m.clear_disk(m.pose.x, m.pose.y):
+        if self.automatic:
+            if not m.swept_clear(turn=max(-30,min(degrees,30))):
+                return False
+        elif not m.clear_disk(m.pose.x,m.pose.y):
             return False
         direction = "l" if degrees < 0 else "r"
         rate = m.arena.left_rate if direction == "l" else m.arena.right_rate
         return self.move(direction, min(abs(degrees), 30), rate)
 
     def explore(self):
-        # Uma passagem atravessada fica no mapa. Só o operador encerra a
-        # exploração normal; uma falha serial continua encerrando a sessão.
         while True:
             self.observe()
-            if not self.next_move():
-                self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
-                            else "Aguardando passagem segura · "+self.wait_reason)
-                for _ in range(4):
-                    if self.interrupt.wait(.5):
-                        raise StopRequested
-                    self.command("state")
+            front = dict(self.scan_points).get(90)
+            if self.decision(front, allow_turn=True):
+                # Após giro ou avanço, a próxima frente é medida na nova
+                # pose. Uma manobra lateral exige nova varredura completa.
+                while self.last_direction in {"f","l","r"} and self.since_scan < 25-self.map.arena.speed*.040:
+                    if not self.decision(self.front_probe(), allow_turn=False):
+                        break
+                continue
+            self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
+                        else "Aguardando passagem segura · "+self.wait_reason)
+            for _ in range(4):
+                if self.interrupt.wait(.5):
+                    raise StopRequested
+                self.command("state")
 
     def run(self):
         try:

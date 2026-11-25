@@ -136,6 +136,7 @@ class BuscaAutomaticaTest(unittest.TestCase):
         with patch.object(nav,"move") as move:
             self.assertFalse(nav.backtrack())
             model.localized = True
+            model.cells.pop((0,0),None)
             self.assertFalse(nav.backtrack())
             move.assert_not_called()
 
@@ -146,6 +147,64 @@ class BuscaAutomaticaTest(unittest.TestCase):
         self.assertEqual(model.pose,Pose(0,7,0))
         self.assertFalse(model.stationary_reference)
 
+    def direcoes(self,left=90,right=90):
+        model = MapaAutomatico()
+        for i in range(-7,8):
+            for j in range(-7,8):
+                model.cells[i,j] = FREE
+        nav = Navigator(None,model,Event(),lambda _: None)
+        nav.scan_points = [(i,left if i<90 else right if i>90 else 30)
+                           for i in range(0,181,10)]
+        nav.side_readings_current = True
+        return model,nav
+
+    def test_frente_tem_prioridade(self):
+        model,nav = self.direcoes()
+        with patch.object(nav,"move",return_value=True) as move:
+            self.assertTrue(nav.decision(80,allow_turn=True))
+        self.assertEqual(model.selected_direction,"f")
+        move.assert_called_once_with("f",8.75,25)
+
+    def test_esquerda_antes_da_direita(self):
+        model,nav = self.direcoes(left=70,right=130)
+        with patch.object(nav,"turn",return_value=True) as turn:
+            self.assertTrue(nav.decision(32,allow_turn=True))
+        self.assertEqual(model.selected_direction,"l")
+        turn.assert_called_once_with(-25)
+
+    def test_tenta_direita_quando_esquerda_esta_ocupada(self):
+        model,nav = self.direcoes(left=30,right=100)
+        with patch.object(nav,"turn",return_value=True) as turn:
+            self.assertTrue(nav.decision(30,allow_turn=True))
+        self.assertEqual(model.selected_direction,"r")
+        turn.assert_called_once_with(25)
+
+    def test_giro_parcial_nao_exige_disco_inteiro(self):
+        model,nav = self.direcoes()
+        full_disk = set(model.footprint(0,0))
+        swept = {k for angle in range(0,26,1)
+                 for k in model.body_cells(0,0,angle,5)}
+        obstruction = next(iter(full_disk-swept))
+        model.cells[obstruction] = OCCUPIED
+        self.assertFalse(model.clear_disk(0,0))
+        self.assertTrue(model.swept_clear(turn=25))
+        model.cells[0,0] = OCCUPIED
+        self.assertFalse(model.swept_clear(turn=25))
+
+    def test_sem_eco_na_frente_nao_dispara_avanco_rapido(self):
+        model,nav = self.direcoes()
+        with patch.object(nav,"move") as move:
+            self.assertFalse(nav.decision(None,allow_turn=False))
+        self.assertIsNone(model.selected_direction)
+        move.assert_not_called()
+
+    def test_avanco_rapido_respeita_25_cm_entre_varreduras(self):
+        _,nav = self.direcoes()
+        nav.since_scan = 21
+        with patch.object(nav,"move",return_value=True) as move:
+            self.assertTrue(nav.decision(80,allow_turn=False))
+        move.assert_called_once_with("f",4,25)
+
     def test_busca_fica_ativa_apos_passagem_ou_falta_de_rota(self):
         model = MapaAutomatico()
         model.passages[(0,0,1)] = {"at":[0,0],"axis":1,"crossed":True}
@@ -155,12 +214,12 @@ class BuscaAutomaticaTest(unittest.TestCase):
         def finish(_):
             stop.set()
             return True
-        with patch.object(nav,"observe") as observe, patch.object(nav,"next_move",return_value=False), patch.object(stop,"wait",side_effect=finish):
+        with patch.object(nav,"observe") as observe, patch.object(nav,"decision",return_value=False), patch.object(stop,"wait",side_effect=finish):
             from ControleAutonomo import StopRequested
             with self.assertRaises(StopRequested):
                 nav.explore()
         observe.assert_called_once()
-        self.assertIn("Aguardando passagem segura", messages)
+        self.assertTrue(any(m.startswith("Aguardando passagem segura") for m in messages))
 
 
 if __name__ == "__main__":

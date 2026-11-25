@@ -399,6 +399,8 @@ class MapaAutomatico(Map):
         # nunca valida uma pose que já estava incerta antes da parada.
         self.stationary_reference = True
         self.awaiting_echo = set()
+        self.directions = {}
+        self.selected_direction = None
 
     @property
     def bounds(self):
@@ -477,24 +479,50 @@ class MapaAutomatico(Map):
         return all(self.cells.get(k) == FREE and k not in self.tentative
                    for dx,dy in offsets for k in self.footprint(x+dx,y+dy))
 
-    def clear_reverse_body(self, x, y):
-        # A ré reta não varre o disco de um giro. A folga usa o retângulo
-        # orientado, expandido pela meia célula para cobrir quinas da grade.
-        margin = MARGIN + math.sqrt(2) * CELL / 2 + min(self.uncertainty, CELL)
-        half_width = self.profile.robot_width / 2 + margin
-        half_length = self.profile.robot_length / 2 + margin
-        radius = math.hypot(half_width, half_length)
-        rad = math.radians(self.pose.heading)
-        for i in range(math.floor((x-radius)/CELL), math.floor((x+radius)/CELL)+1):
-            for j in range(math.floor((y-radius)/CELL), math.floor((y+radius)/CELL)+1):
+    def body_cells(self, x, y, heading, padding):
+        # Eixos separadores do retângulo orientado e da célula quadrada.
+        # Inclui células tocadas pelas quinas, mesmo sem o centro dentro.
+        width = self.profile.robot_width / 2 + padding
+        length = self.profile.robot_length / 2 + padding
+        radius = math.hypot(width,length) + CELL
+        angle = math.radians(heading)
+        c,s = math.cos(angle),math.sin(angle)
+        half_cell = CELL/2
+        extent = half_cell*(abs(c)+abs(s))
+        for i in range(math.floor((x-radius)/CELL),math.floor((x+radius)/CELL)+1):
+            for j in range(math.floor((y-radius)/CELL),math.floor((y+radius)/CELL)+1):
                 cx,cy = midpoint((i,j))
                 dx,dy = cx-x,cy-y
-                lateral = dx*math.cos(rad)-dy*math.sin(rad)
-                longitudinal = dx*math.sin(rad)+dy*math.cos(rad)
-                if abs(lateral) <= half_width and abs(longitudinal) <= half_length:
-                    if self.cells.get((i,j)) != FREE or (i,j) in self.tentative:
-                        return False
+                if (abs(dx) < width*abs(c)+length*abs(s)+half_cell
+                        and abs(dy) < width*abs(s)+length*abs(c)+half_cell
+                        and abs(dx*c-dy*s) < width+extent
+                        and abs(dx*s+dy*c) < length+extent):
+                    yield i,j
+
+    def swept_clear(self, distance=0, turn=0):
+        pose = self.pose
+        steps = max(1,math.ceil(abs(distance)),math.ceil(abs(turn)/3))
+        padding = MARGIN + min(self.uncertainty,CELL)
+        # Células já cobertas pelo chassi não foram observáveis pelo sonar.
+        # Só essa área pode estar sem leitura. Uma marca registrada continua
+        # bloqueando a manobra, inclusive se cair junto da pose calculada.
+        under_robot = set(self.body_cells(pose.x,pose.y,pose.heading,0))
+        swept = set()
+        for i in range(steps+1):
+            fraction = i/steps
+            dx,dy = relative(90,distance*fraction,pose.heading)
+            swept.update(self.body_cells(pose.x+dx,pose.y+dy,pose.heading+turn*fraction,padding))
+        for key in swept:
+            if self.cells.get(key) == OCCUPIED or key in self.tentative:
+                return False
+            if key not in under_robot and self.cells.get(key) != FREE:
+                return False
         return True
+
+    def clear_reverse_body(self, x, y):
+        padding = MARGIN + min(self.uncertainty,CELL)
+        return all(self.cells.get(key) == FREE and key not in self.tentative
+                   for key in self.body_cells(x,y,self.pose.heading,padding))
 
     def observar_passagens(self, hits):
         # Duas bordas alinhadas e um corredor medido nos dois lados formam uma
