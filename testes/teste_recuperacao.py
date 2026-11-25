@@ -39,3 +39,25 @@ class RecuperacaoTest(unittest.TestCase):
         mapa.maneuver_blockers = {"f": {(0,2)}}
         mapa.scan([(90,None)])
         self.assertIn((0,2),mapa.tentative)
+
+    def test_tres_pulsos_em_trecho_livre_nao_forcam_varredura(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None,mapa,Event(),lambda _: None)
+        nav.quick_supported = nav.valid_scan = True
+        nav.since_scan = 26.25
+        with patch.object(mapa,"swept_blockers",return_value=set()), \
+             patch.object(nav,"move",return_value=True) as move:
+            self.assertTrue(nav.decision(80,allow_turn=False))
+            move.assert_called_once_with("f",8.75,25)
+            mapa.uncertainty = 9
+            move.reset_mock()
+            self.assertFalse(nav.decision(80,allow_turn=False))
+            move.assert_not_called()
+
+    def test_marca_em_revisao_antecipa_atualizacao(self):
+        mapa = MapaAutomatico()
+        nav = Navigator(None,mapa,Event(),lambda _: None)
+        nav.quick_supported = nav.valid_scan = True
+        self.assertEqual(nav.scan_budget(),(50,4))
+        mapa.clearing[0,2] = 1
+        self.assertEqual(nav.scan_budget(),(25,2))

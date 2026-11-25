@@ -195,11 +195,20 @@ class Navigator:
         self.map.maneuver_blockers["l" if sign<0 else "r"] = blockers
         return distance,0,"Chassi sem folga no giro" if blockers else "Giros já avaliados nesta posição"
 
+    def scan_budget(self):
+        # Em trecho saudável a frente é conferida a cada pulso. O orçamento
+        # maior reduz pausas sem dispensar a verificação de folga no mapa.
+        if (self.quick_supported and self.valid_scan and self.map.uncertainty <= 8
+                and not self.map.clearing):
+            return 50, 4
+        return 25, 2
+
     def decision(self, front, allow_turn):
         m = self.map
         m.selected_direction = None
         m.maneuver_blockers = {}
-        step = min(m.arena.speed*.350,25-self.since_scan)
+        distance_budget, _ = self.scan_budget()
+        step = min(m.arena.speed*.350,distance_budget-self.since_scan)
         forward = front is not None and front > 45 and step >= m.arena.speed*.040
         if forward:
             blockers = m.swept_blockers(distance=step)
@@ -316,8 +325,12 @@ class Navigator:
             if self.decision(front, allow_turn=True):
                 # A cada pulso, a nova frente pode evitar até mesmo a
                 # leitura curta. Se fechar, mede os lados antes de remapear.
-                while (self.since_scan < 25-self.map.arena.speed*.040
-                       and self.turns_since_scan < 2):
+                while True:
+                    distance_budget, turn_budget = self.scan_budget()
+                    if (self.since_scan >= distance_budget-self.map.arena.speed*.040
+                            or self.turns_since_scan >= turn_budget):
+                        self.notify("Atualizando mapa · limite de distância ou giros atingido")
+                        break
                     if self.decision(self.front_probe(), allow_turn=False):
                         continue
                     if self.quick_supported and self.decision(self.quick_observe(), allow_turn=True):
