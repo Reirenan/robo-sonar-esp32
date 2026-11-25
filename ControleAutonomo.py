@@ -1,5 +1,6 @@
 """Ciclo da exploração. O despacho serial fica em uma única thread do painel."""
 from dataclasses import dataclass
+from collections import Counter
 import math
 import time
 from statistics import median
@@ -56,6 +57,8 @@ class Navigator:
         self.quick_supported = False
         self.side_readings_current = False
         self.turn_attempts = set()
+        self.survey_turns = Counter()
+        self.survey_turn_pending = False
         self.since_scan = 0.0
         self.turns_since_scan = 0
         self.last_direction = None
@@ -255,6 +258,35 @@ class Navigator:
             return 50, 4
         return 25, 2
 
+    def survey_turn(self):
+        """Gira só para observar, sem presumir que há passagem para avançar."""
+        if not self.valid_scan:
+            return False
+        m = self.map
+        pose = m.pose
+        position = cell(pose.x,pose.y)
+        choices = sorted((-1,1),key=lambda sign: (self.survey_turns[position,sign],sign))
+        for sign in choices:
+            turn = sign * 10
+            key = self.turn_key(turn)
+            rate = m.arena.left_rate if sign < 0 else m.arena.right_rate
+            if self.survey_turns[position,sign] >= 2 or key in self.turn_attempts or 10 / rate < .040:
+                continue
+            blockers = m.swept_blockers(turn=turn)
+            side = "l" if sign < 0 else "r"
+            if blockers:
+                m.maneuver_blockers[side] = blockers
+                continue
+            self.turn_attempts.add(key)
+            self.survey_turns[position,sign] += 1
+            m.selected_direction = side
+            self.notify("Giro de observação de 10° à " + ("esquerda" if sign < 0 else "direita"))
+            if self.turn(turn):
+                self.survey_turn_pending = self.quick_supported
+                return True
+        m.selected_direction = None
+        return False
+
     def decision(self, front, allow_turn):
         m = self.map
         m.selected_direction = None
@@ -287,6 +319,8 @@ class Navigator:
                     return True
             m.selected_direction = None
             m.selected_gap = None
+            if self.survey_turn():
+                return True
             # Uma sondagem esparsa nunca é suficiente para optar pela ré.
             if self.scan_kind == "full" and self.backtrack():
                 return True
@@ -398,7 +432,7 @@ class Navigator:
             self.frontier_observations = 0
         m.frontier_target, m.frontier_path = chosen,path
 
-    def pursue_frontier(self, front, allow_turn):
+    def pursue_frontier(self, front, allow_turn, replan=True):
         """Executa um trecho da rota e pede desvio apenas se ela bloquear."""
         m = self.map
         if m.frontier_target is None:
@@ -440,13 +474,15 @@ class Navigator:
 
         if not allow_turn:
             return False
+        if not replan:
+            return self.decision(None,allow_turn=True)
         # Uma aresta rejeitada volta a ser elegível se a região mudar.
         origin,destination = cell(pose.x,pose.y),cell(*waypoint)
         self.blocked_edges[origin,destination] = (m.frontier_signature(origin),m.frontier_signature(destination))
         self.plan_frontier()
         if m.frontier_path and m.frontier_path[0] != waypoint:
             self.notify("Rota recalculada · seguindo pela área conhecida")
-            return False
+            return self.pursue_frontier(front,allow_turn=True,replan=False)
         return self.decision(None,allow_turn=True)
 
     def explore(self):
@@ -456,10 +492,20 @@ class Navigator:
             front = dict(self.scan_points).get(90)
             if self.map.frontier_target is not None and not self.map.frontier_path:
                 continue
-            if self.pursue_frontier(front, allow_turn=True):
+            moved = self.pursue_frontier(front,allow_turn=True)
+            if not moved and self.quick_supported and any(self.map.maneuver_blockers.values()):
+                self.notify("Reavaliando a margem da manobra")
+                moved = self.pursue_frontier(self.quick_observe(),allow_turn=True)
+            if moved:
                 # A cada pulso, a nova frente pode evitar até mesmo a
                 # leitura curta. Se fechar, mede os lados antes de remapear.
                 while True:
+                    if self.survey_turn_pending:
+                        self.survey_turn_pending = False
+                        front = self.quick_observe()
+                        if self.pursue_frontier(front,allow_turn=True):
+                            continue
+                        break
                     distance_budget, turn_budget = self.scan_budget()
                     if (self.since_scan >= distance_budget-self.map.arena.speed*.040
                             or self.turns_since_scan >= turn_budget):
@@ -476,17 +522,6 @@ class Navigator:
                         continue
                     break
                 continue
-            groups = self.map.maneuver_blockers
-            blocked_cells = set().union(*groups.values()) if groups else set()
-            if self.quick_supported and blocked_cells:
-                side = "esquerda" if groups.get("l") else "direita" if groups.get("r") else "frontal"
-                self.notify(f"Reavaliando margem {side}")
-                outside = self.map.blockers_outside_quick(blocked_cells)
-                if self.pursue_frontier(self.quick_observe(), allow_turn=True):
-                    continue
-                if outside:
-                    self.notify("Atualizando mapa · margem fora da leitura curta")
-                    continue
             self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
                         else "Aguardando passagem segura · "+self.wait_reason)
             for _ in range(4):
