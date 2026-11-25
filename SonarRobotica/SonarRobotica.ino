@@ -17,7 +17,7 @@ constexpr uint16_t SERVO_MIN_US = 1000, SERVO_MAX_US = 2000;
 // Nesta montagem o pulso menor apontava para a direita. O mapa sempre
 // recebe o ângulo lógico: 0° à esquerda, 90° à frente, 180° à direita.
 constexpr bool REVERSE_SERVO = true;
-constexpr uint32_t AUTO_MAX_MS = 350, AUTO_LEASE_MS = 2500;
+constexpr uint32_t AUTO_MAX_MS = 350, AUTO_REVERSE_MS = 120, AUTO_LEASE_MS = 2500;
 constexpr uint16_t MAX_CM = 400;
 constexpr uint8_t ANGLE_STEP = 10, LEFT_ANGLE = 0, LAST_ANGLE = 180;
 constexpr uint8_t CENTER_ANGLE = LAST_ANGLE / 2;
@@ -58,6 +58,7 @@ struct Reading {
 
 ScanState scanState = ScanState::idle;
 Reading readings[POINTS];
+uint16_t rawPulses[POINTS][SAMPLES_PER_POINT];
 uint8_t count = 0;
 uint8_t angle = HOME_ANGLE;
 uint8_t tries = 0, validCount = 0;
@@ -123,10 +124,14 @@ bool startMotion(uint32_t durationMs, char direction) {
   if (!motorReady || motorBusy(true)) return false;
   xSemaphoreTake(motorLock, portMAX_DELAY);
   // Num giro no lugar as duas rodas têm sentidos opostos.
-  digitalWrite(LEFT_REV, direction == 'l' ? HIGH : LOW);
-  digitalWrite(RIGHT_REV, direction == 'r' ? HIGH : LOW);
-  digitalWrite(LEFT_FWD, direction == 'l' ? LOW : HIGH);
-  digitalWrite(RIGHT_FWD, direction == 'r' ? LOW : HIGH);
+  // A ré inverte as duas rodas e usa apenas o temporizador. O sonar
+  // está na frente; a autorização do trecho já percorrido cabe ao painel.
+  const bool leftReverse = direction == 'l' || direction == 'b';
+  const bool rightReverse = direction == 'r' || direction == 'b';
+  digitalWrite(LEFT_REV, leftReverse ? HIGH : LOW);
+  digitalWrite(RIGHT_REV, rightReverse ? HIGH : LOW);
+  digitalWrite(LEFT_FWD, leftReverse ? LOW : HIGH);
+  digitalWrite(RIGHT_FWD, rightReverse ? LOW : HIGH);
   const bool powered = ledcWrite(LEFT_ENABLE, PWM_LEFT) && ledcWrite(RIGHT_ENABLE, PWM_RIGHT);
   const int64_t now = esp_timer_get_time();
   autoStartedUs = direction && powered ? now : 0;
@@ -197,13 +202,14 @@ bool checkAutoFront() {
 int startAuto(const char* action, const char*& error) {
   const char direction = action[5];
   char* end = nullptr;
-  if ((direction != 'f' && direction != 'l' && direction != 'r') || action[6] != '_') {
+  if ((direction != 'f' && direction != 'l' && direction != 'r' && direction != 'b') || action[6] != '_') {
     error = "Direção autônoma inválida.";
     return 400;
   }
   const unsigned long duration = strtoul(action + 7, &end, 10);
-  if (*end || duration < 40 || duration > AUTO_MAX_MS) {
-    error = "Pulso de tração fora do intervalo de 40 a 350 ms.";
+  const uint32_t maxDuration = direction == 'b' ? AUTO_REVERSE_MS : AUTO_MAX_MS;
+  if (*end || duration < 40 || duration > maxDuration) {
+    error = "Duração inválida para este sentido de tração.";
     return 400;
   }
   if (!autoActive || activityRunning() || motorBusy(true) || !servoReady || !motorReady || angle != CENTER_ANGLE) {
@@ -352,6 +358,7 @@ void updateScan() {
 
   const uint32_t startedAt = millis();
   const unsigned long pulseUs = measureEchoUs();
+  rawPulses[count][tries] = static_cast<uint16_t>(pulseUs);
   if (pulseUs != 0) ++scanEchoes;
   const float cm = echoDistanceCm(pulseUs);
   if (cm >= 2.0f && cm <= MAX_CM) {
@@ -395,7 +402,7 @@ const char* stateName() {
 
 String buildState() {
   String json;
-  json.reserve(1000);
+  json.reserve(1800);
   json += "{\"state\":\"";
   json += stateName();
   json += "\",\"angle\":";
@@ -424,6 +431,8 @@ String buildState() {
   }
   json += ",\"autoVersion\":1,\"autoElapsedMs\":";
   json += String(elapsed);
+  json += ",\"reverseMaxMs\":";
+  json += String(AUTO_REVERSE_MS);
   json += ",\"autoActive\":";
   json += autoActive ? "true" : "false";
   json += ",\"autoEnd\":\"";
@@ -441,6 +450,16 @@ String buildState() {
     json += ',';
     if (readings[i].distance < 0) json += "null";
     else json += String(readings[i].distance, 1);
+    json += ']';
+  }
+  json += "],\"rawPulses\":[";
+  for (uint8_t i = 0; i < count; ++i) {
+    if (i) json += ',';
+    json += '[';
+    for (uint8_t j = 0; j < SAMPLES_PER_POINT; ++j) {
+      if (j) json += ',';
+      json += String(rawPulses[i][j]);
+    }
     json += ']';
   }
   json += "]}";

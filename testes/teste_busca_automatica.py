@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
@@ -22,13 +23,25 @@ class BuscaAutomaticaTest(unittest.TestCase):
         target = cell(0,45)
         model.scan([(90,45)])
         model.scan([(90,None)])
+        self.assertNotIn(target,model.clearing)
+        model.scan([(90,120),(90,121)])
+        self.assertEqual(model.cells[target],OCCUPIED)
+        self.assertEqual(model.clearing[target],1)
+        model.scan([(90,None)])
+        self.assertEqual(model.cells[target],OCCUPIED)
         model.scan([(90,120)])
-        self.assertEqual(model.cells[target], OCCUPIED)
-        with patch("Navegacao.reconhecer_pose", return_value=Pose()):
-            model.scan([(90,120), (90,121)])
-            self.assertEqual(model.cells[target], OCCUPIED)
-            model.scan([(90,120)])
-        self.assertEqual(model.cells[target], FREE)
+        self.assertEqual(model.cells[target],FREE)
+
+    def test_roda_em_movimento_invalida_referencia_para_remover(self):
+        model = MapaAutomatico()
+        target = cell(0,45)
+        model.scan([(90,45)])
+        model.integrate("f",200)
+        with patch("Navegacao.reconhecer_pose",return_value=None):
+            model.scan([(90,110)])
+            model.scan([(90,110)])
+        self.assertEqual(model.cells[target],OCCUPIED)
+        self.assertNotIn(target,model.clearing)
 
     def test_passagem_atravessada_e_salva(self):
         model = MapaAutomatico()
@@ -83,6 +96,55 @@ class BuscaAutomaticaTest(unittest.TestCase):
             self.assertFalse(nav.move("f",8,25))
         self.assertTrue(model.direction_blocked(0))
         self.assertEqual(model.pose,Pose())
+
+    def test_re_sem_trajeto_na_origem(self):
+        model = MapaAutomatico()
+        nav = Navigator(None,model,Event(),lambda _: None)
+        nav.reverse_limit = 120
+        with patch.object(nav,"move") as move:
+            self.assertFalse(nav.backtrack())
+            move.assert_not_called()
+
+    def test_re_curta_respeita_tempo_e_limite_do_trecho(self):
+        model = MapaAutomatico()
+        for i in range(-8,9):
+            for j in range(-8,9):
+                model.cells[i,j] = FREE
+        model.pose = Pose(0,10,0)
+        model.localized = True
+        nav = Navigator(None,model,Event(),lambda _: None)
+        nav.reverse_limit = 120
+        nav.rear_origin = Pose()
+        nav.rear_heading = 0
+        nav.forward_at = monotonic()
+        with patch.object(nav,"move",return_value=True) as move:
+            self.assertTrue(nav.backtrack())
+            move.assert_called_once_with("b",3,25)
+            move.reset_mock()
+            model.pose = Pose(0,1,0)
+            self.assertFalse(nav.backtrack())
+            move.assert_not_called()
+
+    def test_re_exige_folga_e_posicao_confirmada(self):
+        model = MapaAutomatico()
+        model.pose = Pose(0,10,0)
+        nav = Navigator(None,model,Event(),lambda _: None)
+        nav.reverse_limit = 120
+        nav.rear_origin = Pose()
+        nav.rear_heading = 0
+        nav.forward_at = monotonic()
+        with patch.object(nav,"move") as move:
+            self.assertFalse(nav.backtrack())
+            model.localized = True
+            self.assertFalse(nav.backtrack())
+            move.assert_not_called()
+
+    def test_integracao_de_re_mantem_rumo(self):
+        model = MapaAutomatico()
+        model.pose = Pose(0,10,0)
+        model.integrate("b",120)
+        self.assertEqual(model.pose,Pose(0,7,0))
+        self.assertFalse(model.stationary_reference)
 
     def test_busca_fica_ativa_apos_passagem_ou_falta_de_rota(self):
         model = MapaAutomatico()

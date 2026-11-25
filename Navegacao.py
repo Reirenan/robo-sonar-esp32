@@ -289,8 +289,9 @@ class Map:
         """Integra tempo de tração informado pela ESP32, em vez do tempo USB."""
         pose = self.pose
         seconds = elapsed_ms / 1000
-        if direction == "f":
-            dx, dy = relative(90, self.arena.speed * seconds, pose.heading)
+        if direction in {"f","b"}:
+            sign = -1 if direction == "b" else 1
+            dx, dy = relative(90, sign * self.arena.speed * seconds, pose.heading)
             self.pose = Pose(pose.x + dx, pose.y + dy, pose.heading)
             self.trail.append(self.pose)
         else:
@@ -394,6 +395,10 @@ class MapaAutomatico(Map):
         self.blocked = set()
         self.uncertainty = 0
         self.has_scan = False
+        # A origem é conhecida até o primeiro pulso. O repouso, por si só,
+        # nunca valida uma pose que já estava incerta antes da parada.
+        self.stationary_reference = True
+        self.awaiting_echo = set()
 
     @property
     def bounds(self):
@@ -409,9 +414,10 @@ class MapaAutomatico(Map):
         return any((x,y,(sector+offset)%12) in self.blocked for offset in (-1,0,1))
 
     def scan(self, points):
-        corrected = reconhecer_pose(self.cells,self.pose,points) if self.has_scan else None
-        self.localized = corrected is not None
+        corrected = reconhecer_pose(self.cells,self.pose,points) if self.has_scan and not self.stationary_reference else None
+        self.localized = self.stationary_reference or corrected is not None
         if corrected:
+            self.stationary_reference = True
             self.pose = corrected
             self.uncertainty = 0
             if len(self.trail) > 1:
@@ -441,12 +447,25 @@ class MapaAutomatico(Map):
                 del self.clearing[key]
                 self.tentative.discard(key)
             self.cells[key] = FREE
+        # Sem retorno, a leitura só muda a etiqueta da marca. Ela nunca
+        # fornece a evidência geométrica necessária para declarar espaço livre.
+        missing_angles = [a for a,d in points if d is None]
+        self.awaiting_echo = set()
+        if missing_angles:
+            for key in self.tentative | {k for k,v in self.cells.items() if v == OCCUPIED}:
+                x,y = midpoint(key)
+                dx,dy = x-pose.x,y-pose.y
+                if math.hypot(dx,dy) <= 400:
+                    heading = math.degrees(math.atan2(dx,dy))
+                    angle = 90 + delta(heading,pose.heading)
+                    if any(abs(angle-a) <= 5 for a in missing_angles):
+                        self.awaiting_echo.add(key)
         if hits:
             self.has_scan = True
         key = self.chave_direcao(pose.heading)
         self.visited[key] = self.visited.get(key,0)+1
         for angle, cm in returns(points):
-            if cm > 55:
+            if cm > 55 and self.localized:
                 self.blocked.discard(self.chave_direcao(pose.heading+angle-90))
         self.observar_passagens(hits)
 
@@ -457,6 +476,25 @@ class MapaAutomatico(Map):
         offsets = ((0,0),(radius_margin,0),(-radius_margin,0),(0,radius_margin),(0,-radius_margin))
         return all(self.cells.get(k) == FREE and k not in self.tentative
                    for dx,dy in offsets for k in self.footprint(x+dx,y+dy))
+
+    def clear_reverse_body(self, x, y):
+        # A ré reta não varre o disco de um giro. A folga usa o retângulo
+        # orientado, expandido pela meia célula para cobrir quinas da grade.
+        margin = MARGIN + math.sqrt(2) * CELL / 2 + min(self.uncertainty, CELL)
+        half_width = self.profile.robot_width / 2 + margin
+        half_length = self.profile.robot_length / 2 + margin
+        radius = math.hypot(half_width, half_length)
+        rad = math.radians(self.pose.heading)
+        for i in range(math.floor((x-radius)/CELL), math.floor((x+radius)/CELL)+1):
+            for j in range(math.floor((y-radius)/CELL), math.floor((y+radius)/CELL)+1):
+                cx,cy = midpoint((i,j))
+                dx,dy = cx-x,cy-y
+                lateral = dx*math.cos(rad)-dy*math.sin(rad)
+                longitudinal = dx*math.sin(rad)+dy*math.cos(rad)
+                if abs(lateral) <= half_width and abs(longitudinal) <= half_length:
+                    if self.cells.get((i,j)) != FREE or (i,j) in self.tentative:
+                        return False
+        return True
 
     def observar_passagens(self, hits):
         # Duas bordas alinhadas e um corredor medido nos dois lados formam uma
@@ -542,8 +580,9 @@ class MapaAutomatico(Map):
         before = self.pose
         super().integrate(direction,elapsed_ms)
         after = self.pose
+        self.stationary_reference = False
         self.uncertainty += (math.hypot(after.x-before.x,after.y-before.y)*.06
-                             if direction == "f" else abs(delta(after.heading,before.heading))*.04)
+                             if direction in {"f","b"} else abs(delta(after.heading,before.heading))*.04)
         for opening in self.passages.values():
             axis = opening["axis"]
             x0,x1 = (before.x,before.y)[axis], (after.x,after.y)[axis]
@@ -561,16 +600,19 @@ class MapaAutomatico(Map):
             "cells": [[*key,value] for key,value in sorted(self.cells.items())],
             "tentative": sorted(self.tentative),"passages": list(self.passages.values()),
             "clearing": [[*key,value] for key,value in self.clearing.items()],
+            "awaiting_echo": sorted(self.awaiting_echo),
         }, ensure_ascii=False),encoding="utf-8")
         temp.replace(path)
 
     @classmethod
     def from_data(cls,data):
         result = cls()
+        result.stationary_reference = False
         result.pose = Pose(**data["pose"])
         result.trail = [Pose(**p) for p in data["trail"]]
         result.cells = {(x,y): value for x,y,value in data["cells"]}
         result.tentative = {tuple(key) for key in data.get("tentative",[])}
         result.clearing = {(x,y): value for x,y,value in data.get("clearing",[])}
+        result.awaiting_echo = {tuple(k) for k in data.get("awaiting_echo",[])}
         result.passages = {(*cell(*entry["at"]),entry["axis"]): entry for entry in data["passages"]}
         return result

@@ -26,28 +26,26 @@ class Panel:
         root.minsize(810, 550)
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Escape>", lambda _: self.stop.set())
-        body = ttk.Panedwindow(root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=12, pady=12)
-        form = ttk.Frame(body, padding=8)
-        view = ttk.Frame(body)
-        body.add(form, weight=0)
-        body.add(view, weight=1)
-        ttk.Label(form, text="Exploração", font=("Segoe UI",15,"bold")).pack(anchor="w")
-        ttk.Label(form, text="Posicione o robô em área livre.\nA partida será a origem (0,0).",
-                  justify="left").pack(anchor="w", pady=(6,14))
-        self.start_button = ttk.Button(form, text="Iniciar", command=self.start)
-        self.start_button.pack(fill="x", pady=4)
-        self.stop_button = ttk.Button(form, text="Parar  (Esc)", command=self.stop.set, state="disabled")
-        self.stop_button.pack(fill="x", pady=4)
-        self.open_button = ttk.Button(form, text="Abrir mapa JSON", command=self.open_map)
-        self.open_button.pack(fill="x", pady=4)
-        self.status = ttk.Label(view, text="Pronto para explorar. O chassi começa em (0,0), apontado para +Y.",
-                                wraplength=620, padding=(8,6))
+        body = ttk.Frame(root,padding=(16,12))
+        body.pack(fill="both",expand=True)
+        toolbar = ttk.Frame(body)
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar,text="Mapa da arena",font=("Segoe UI",17,"bold")).pack(side="left",padx=(0,20))
+        self.start_button = ttk.Button(toolbar,text="Iniciar",command=self.start)
+        self.start_button.pack(side="left",padx=(0,6))
+        self.stop_button = ttk.Button(toolbar,text="Parar (Esc)",command=self.stop.set,state="disabled")
+        self.stop_button.pack(side="left",padx=(0,6))
+        self.open_button = ttk.Button(toolbar,text="Abrir mapa",command=self.open_map)
+        self.open_button.pack(side="right")
+        self.status = ttk.Label(body,text="Pronto. Posicione o robô em área livre antes de iniciar.",
+                                wraplength=760,padding=(0,9))
         self.status.pack(fill="x")
-        self.legend = ttk.Label(view, padding=8,
-                                text="Cinza escuro: desconhecido   ·   Azul: livre   ·   Vermelho: ocupado\n"
-                                     "Verde: trajetória   ·   Amarelo: passagem provável   ·   Branco: posição estimada\nLaranja: eco com posição incerta")
-        self.legend.pack(anchor="w")
+        view = ttk.Frame(body)
+        view.pack(fill="both",expand=True)
+        self.legend = ttk.Label(body,padding=(0,8),
+                                text="Azul: livre   ·   Vermelho: obstáculo   ·   Âmbar: em revisão   ·   Verde: trajetória")
+        self.legend.pack(side="bottom",anchor="w")
+        self.viewport = None
         self.canvas = tk.Canvas(view, bg="#0b151c", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _: self.draw())
@@ -61,6 +59,7 @@ class Panel:
     def start(self):
         if self.busy():
             return
+        self.viewport = None
         self.map = MapaAutomatico()
         self.target = SESSION
         self.start_worker(self.run, self.map)
@@ -97,6 +96,8 @@ class Panel:
         result.pose, result.trail = model.pose, list(model.trail)
         result.cells = model.cells.copy()
         result.tentative = set(model.tentative)
+        result.clearing = dict(model.clearing)
+        result.awaiting_echo = set(model.awaiting_echo)
         result.localized = model.localized
         result.passages = {key: value.copy() for key,value in model.passages.items()}
         return result
@@ -119,6 +120,7 @@ class Panel:
     def read_map(self, path):
         try:
             self.map = Map.load(path)
+            self.viewport = None
             self.status.configure(text="Mapa salvo carregado. Para iniciar outra exploração, reposicione o robô na origem.")
             self.draw()
         except (OSError, ValueError, TypeError, KeyError) as error:
@@ -135,27 +137,45 @@ class Panel:
         if m is None:
             return
         x0,x1,y0,y1 = m.bounds if isinstance(m, MapaAutomatico) else m.arena.walls
-        pad = max(25, m.arena.radius + CELL)
+        pad = max(25,m.arena.radius+CELL)
+        bounds = (x0-pad,x1+pad,y0-pad,y1+pad)
+        if self.viewport:
+            old = self.viewport
+            bounds = (min(bounds[0],old[0]),max(bounds[1],old[1]),
+                      min(bounds[2],old[2]),max(bounds[3],old[3]))
+        self.viewport = bounds
+        x0,x1,y0,y1 = bounds
         width, height = c.winfo_width(), c.winfo_height()
-        scale = min((width-54)/(x1-x0+2*pad), (height-50)/(y1-y0+2*pad))
+        scale = min((width-80)/(x1-x0), (height-64)/(y1-y0))
         if scale <= 0:
             return
 
         def xy(x,y):
-            return 30+(x-x0+pad)*scale, height-30-(y-y0+pad)*scale
+            return (width-(x1-x0)*scale)/2+(x-x0)*scale, (height+(y1-y0)*scale)/2-(y-y0)*scale
 
         for (i,j), value in m.cells.items():
             if value not in (FREE,OCCUPIED):
                 continue
             ax,ay = xy(i*CELL,(j+1)*CELL)
             bx,by = xy((i+1)*CELL,j*CELL)
-            c.create_rectangle(ax,ay,bx,by,fill="#234c62" if value == FREE else "#ed766e",outline="")
+            c.create_rectangle(ax,ay,bx,by,fill="#183748" if value == FREE else "#df6675",outline="")
         for i, j in m.tentative:
             ax,ay = xy(i*CELL,(j+1)*CELL)
             bx,by = xy((i+1)*CELL,j*CELL)
             c.create_rectangle(ax,ay,bx,by,outline="#ffad5a",width=2)
+        for i,j in getattr(m,"awaiting_echo",set()) - m.clearing.keys():
+            ax,ay = xy(i*CELL,(j+1)*CELL)
+            bx,by = xy((i+1)*CELL,j*CELL)
+            c.create_rectangle(ax,ay,bx,by,outline="#f5c667",width=1,dash=(3,3))
+        for (i,j), votes in m.clearing.items():
+            ax,ay = xy(i*CELL,(j+1)*CELL)
+            bx,by = xy((i+1)*CELL,j*CELL)
+            c.create_rectangle(ax,ay,bx,by,outline="#f5c667",width=2)
+            if scale*CELL >= 20:
+                c.create_text((ax+bx)/2,(ay+by)/2,text=f"{votes}/2",fill="#fff1cc",font=("Segoe UI",8,"bold"))
         if not isinstance(m, MapaAutomatico):
-            c.create_rectangle(*xy(x0,y1),*xy(x1,y0),outline="#637d89",dash=(4,4))
+            left,right,back,front = m.arena.walls
+            c.create_rectangle(*xy(left,front),*xy(right,back),outline="#637d89",dash=(4,4))
         marks = 100 if scale < .8 else 50
         for x in range(math.ceil(x0/marks)*marks, math.floor(x1/marks)*marks+1, marks):
             sx,sy = xy(x,y0)
@@ -178,8 +198,8 @@ class Panel:
         dx,dy = relative(90, m.arena.radius, m.pose.heading)
         c.create_oval(ox-4,oy-4,ox+4,oy+4,fill="white",outline="")
         c.create_line(ox,oy,*xy(m.pose.x+dx,m.pose.y+dy),arrow="last",fill="white",width=2)
-        c.create_line(24,height-15,24+50*scale,height-15,fill="white",width=3)
-        c.create_text(29+50*scale,height-15,anchor="w",text="50 cm" if m.localized else "≈ 50 cm",fill="white")
+        c.create_line(18,height-17,18+50*scale,height-17,fill="#dce7f2",width=2)
+        c.create_text(25+50*scale,height-17,anchor="w",text="50 cm" if m.localized else "≈ 50 cm",fill="white")
 
     def close(self):
         if self.busy():

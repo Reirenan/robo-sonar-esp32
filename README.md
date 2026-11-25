@@ -64,7 +64,13 @@ Alimente o SG90 e o HC-SR04 com 5 V regulados e compartilhe o GND com a ESP32 e 
 - O perfil interno pressupõe um chassi de **25 × 30 cm**, velocidade de **25 cm/s** e giros de **100°/s**. São referências conservadoras de software e a escala é estimada. Se o chassi real for maior, ajuste o perfil em `Navegacao.py` antes de usar a autonomia.
 - O robô alterna pulsos de tração de até **350 ms** com varreduras paradas. Ao avançar, a ESP32 corta a tração se detectar um obstáculo a **45 cm ou menos**, ou se o sonar deixar de receber eco. O corte de tempo e a perda do vínculo USB também são tratados pela placa.
 - O planejador prioriza fronteiras e usa células livres para retornar a uma área com outras direções possíveis. Se cair numa situação sem passagem observável, mantém as rodas paradas, informa **Aguardando passagem segura** e volta a medir. Uma queda da COM3 encerra a sessão.
-- Uma passagem provável precisa de bordas observadas e de folga medível dos dois lados. Sem delimitar o perímetro, o sonar não consegue garantir que a passagem é a saída da arena. Uma marca de obstáculo só some após duas varreduras com pose corrigida mostrarem ecos válidos além dela.
+- Uma passagem provável precisa de bordas observadas e de folga medível dos dois lados. Sem delimitar o perímetro, o sonar não consegue garantir que a passagem é a saída da arena. A marca some após duas varreduras válidas além dela. Com o robô imóvel, vale a última posição confiável. Depois de mover as rodas, o sonar precisa reconhecer a posição novamente. Âmbar com **1/2** indica a primeira confirmação. Uma marca sem retorno correspondente continua aguardando confirmação.
+
+### Recuperação por ré
+
+Se o robô ficar bloqueado, o painel procura primeiro um giro com folga. A ré fica limitada a **120 ms** por pulso e só é autorizada sobre o último trecho reto percorrido, enquanto a posição for confiável e a faixa atrás do chassi continuar livre no mapa. O sonar mede à frente. Ao iniciar cercado, sem histórico traseiro, o robô mantém as rodas paradas. Pressione **Parar** ou **Esc** para cancelar.
+
+O estado serial inclui `reverseMaxMs` e `rawPulses`. Os cinco pulsos brutos em microssegundos por ângulo aparecem na ordem de aquisição. Zero representa ausência de pulso capturado. Compare uma varredura com caixa e outra sem caixa para distinguir marca antiga de um eco que ainda chega ao sensor.
 
 ### Testes
 
