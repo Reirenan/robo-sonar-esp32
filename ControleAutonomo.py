@@ -64,6 +64,10 @@ class Navigator:
         self.rear_heading = None
         self.forward_at = 0.0
         self.wait_reason = "Aguardando passagem segura"
+        self.deferred_frontiers = {}
+        self.blocked_edges = {}
+        self.frontier_baseline = set()
+        self.frontier_observations = 0
 
     def check_stop(self):
         if self.interrupt.is_set():
@@ -368,11 +372,91 @@ class Navigator:
         rate = m.arena.left_rate if direction == "l" else m.arena.right_rate
         return self.move(direction, min(abs(degrees), 30), rate)
 
+    def plan_frontier(self):
+        m = self.map
+        current = cell(m.pose.x,m.pose.y)
+        target = m.frontier_target
+        if target == current:
+            revealed = any(key in m.cells for key in self.frontier_baseline)
+            self.frontier_observations += 1
+            if revealed or self.frontier_observations >= 2:
+                self.deferred_frontiers[target] = m.frontier_signature(target)
+                target = None
+            else:
+                m.frontier_path = []
+                m.maneuver_blockers = {}
+                self.notify("Observando a fronteira novamente")
+                return
+
+        excluded = {edge for edge, signature in self.blocked_edges.items()
+                    if signature == (m.frontier_signature(edge[0]),m.frontier_signature(edge[1]))}
+        chosen,path = m.plan_frontier(target,self.deferred_frontiers,excluded)
+        if chosen != target and target is not None:
+            self.deferred_frontiers[target] = m.frontier_signature(target)
+        if chosen != m.frontier_target:
+            self.frontier_baseline = m.frontier_evidence(chosen) if chosen is not None else set()
+            self.frontier_observations = 0
+        m.frontier_target, m.frontier_path = chosen,path
+
+    def pursue_frontier(self, front, allow_turn):
+        """Executa um trecho da rota e pede desvio apenas se ela bloquear."""
+        m = self.map
+        if m.frontier_target is None:
+            return self.decision(front,allow_turn)
+        pose = m.pose
+        if not m.frontier_path:
+            return False
+        if m.uncertainty > 30:
+            self.wait_reason = "Posição incerta · aguardando varredura"
+            return False
+        waypoint = m.frontier_path[0]
+        dx,dy = waypoint[0]-pose.x,waypoint[1]-pose.y
+        turn = delta(math.degrees(math.atan2(dx,dy)),pose.heading)
+        m.selected_gap = None
+        m.selected_direction = None
+        m.maneuver_blockers = {}
+        m.directions["f"] = (front,"Via planejada" if front is not None and front > 45 else "Aguardando eco livre")
+        if abs(turn) > 12:
+            rate = m.arena.left_rate if turn < 0 else m.arena.right_rate
+            for size in dict.fromkeys((min(abs(turn),25),15,10,5)):
+                if size > abs(turn) or size / rate < .040:
+                    continue
+                rotation = math.copysign(size,turn)
+                key = self.turn_key(rotation)
+                if key not in self.turn_attempts and m.swept_clear(turn=rotation):
+                    self.turn_attempts.add(key)
+                    m.selected_direction = "l" if turn < 0 else "r"
+                    self.notify("Alinhando para seguir a rota")
+                    if self.turn(rotation):
+                        return True
+        elif front is not None and front > 45:
+            step = min(math.hypot(dx,dy),m.arena.speed*.350,self.scan_budget()[0]-self.since_scan)
+            if step >= m.arena.speed*.040 and m.swept_clear(distance=step):
+                m.selected_direction = "f"
+                known = any(visit[:2] == cell(*waypoint) for visit in m.visited)
+                self.notify("Voltando por caminho conhecido" if known else "Indo para uma nova área")
+                if self.move("f",step,m.arena.speed):
+                    return True
+
+        if not allow_turn:
+            return False
+        # Uma aresta rejeitada volta a ser elegível se a região mudar.
+        origin,destination = cell(pose.x,pose.y),cell(*waypoint)
+        self.blocked_edges[origin,destination] = (m.frontier_signature(origin),m.frontier_signature(destination))
+        self.plan_frontier()
+        if m.frontier_path and m.frontier_path[0] != waypoint:
+            self.notify("Rota recalculada · seguindo pela área conhecida")
+            return False
+        return self.decision(None,allow_turn=True)
+
     def explore(self):
         while True:
             self.observe()
+            self.plan_frontier()
             front = dict(self.scan_points).get(90)
-            if self.decision(front, allow_turn=True):
+            if self.map.frontier_target is not None and not self.map.frontier_path:
+                continue
+            if self.pursue_frontier(front, allow_turn=True):
                 # A cada pulso, a nova frente pode evitar até mesmo a
                 # leitura curta. Se fechar, mede os lados antes de remapear.
                 while True:
@@ -381,9 +465,14 @@ class Navigator:
                             or self.turns_since_scan >= turn_budget):
                         self.notify("Atualizando mapa · limite de distância ou giros atingido")
                         break
-                    if self.decision(self.front_probe(), allow_turn=False):
+                    if self.map.frontier_target is not None:
+                        if cell(self.map.pose.x,self.map.pose.y) == self.map.frontier_target:
+                            self.map.frontier_path = []
+                            break
+                        self.plan_frontier()
+                    if self.pursue_frontier(self.front_probe(), allow_turn=False):
                         continue
-                    if self.quick_supported and self.decision(self.quick_observe(), allow_turn=True):
+                    if self.quick_supported and self.pursue_frontier(self.quick_observe(), allow_turn=True):
                         continue
                     break
                 continue
@@ -393,7 +482,7 @@ class Navigator:
                 side = "esquerda" if groups.get("l") else "direita" if groups.get("r") else "frontal"
                 self.notify(f"Reavaliando margem {side}")
                 outside = self.map.blockers_outside_quick(blocked_cells)
-                if self.decision(self.quick_observe(), allow_turn=True):
+                if self.pursue_frontier(self.quick_observe(), allow_turn=True):
                     continue
                 if outside:
                     self.notify("Atualizando mapa · margem fora da leitura curta")

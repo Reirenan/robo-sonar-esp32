@@ -266,7 +266,7 @@ class BuscaAutomaticaTest(unittest.TestCase):
                 nav.since_scan = 25
             return front in {30,99}
 
-        with patch.object(nav,"observe",side_effect=observe), \
+        with patch.object(nav,"plan_frontier"), patch.object(nav,"observe",side_effect=observe), \
              patch.object(nav,"front_probe",return_value=None), \
              patch.object(nav,"quick_observe",return_value=99) as quick, \
              patch.object(nav,"decision",side_effect=decide):

@@ -404,6 +404,8 @@ class MapaAutomatico(Map):
         self.quick_active = False
         self.selected_direction = None
         self.selected_gap = None
+        self.frontier_target = None
+        self.frontier_path = []
         self.maneuver_blockers = {}
         self.tentative_reference = None
         self.quick_free = set()
@@ -522,7 +524,7 @@ class MapaAutomatico(Map):
         # o obstáculo observado. Também se preserva a folga ao integrar pulsos.
         radius_margin = min(self.uncertainty,CELL)
         offsets = ((0,0),(radius_margin,0),(-radius_margin,0),(0,radius_margin),(0,-radius_margin))
-        return all(self.cells.get(k) == FREE and k not in self.tentative
+        return all(self.cells.get(k) == FREE and k not in self.tentative and k not in self.quick_hits
                    for dx,dy in offsets for k in self.footprint(x+dx,y+dy))
 
     def body_cells(self, x, y, heading, padding):
@@ -596,6 +598,84 @@ class MapaAutomatico(Map):
                         continue
                     key = (*cell(*mid),across)
                     self.passages.setdefault(key, {"at": mid,"axis": across,"crossed": False})
+
+    def frontier_evidence(self, key):
+        # Procura o primeiro espaço desconhecido além da folga do chassi.
+        # Obstáculos e ecos provisórios interrompem cada linha de visão.
+        result = set()
+        reach = math.ceil(self.profile.radius / CELL) + 4
+        for di,dj in ((0,1),(1,0),(0,-1),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)):
+            for step in range(1,reach+1):
+                probe = key[0]+di*step,key[1]+dj*step
+                if probe in self.tentative or self.cells.get(probe) == OCCUPIED:
+                    break
+                if probe not in self.cells:
+                    result.add(probe)
+                    break
+        return result
+
+    def frontier_signature(self, key):
+        radius = math.ceil(self.profile.radius / CELL) + 4
+        return tuple(self.cells.get((i,j),UNKNOWN) | (4 if (i,j) in self.tentative else 0)
+                     for i in range(key[0]-radius,key[0]+radius+1)
+                     for j in range(key[1]-radius,key[1]+radius+1))
+
+    def plan_frontier(self, target, deferred, excluded_edges=()):
+        """Busca em largura com folga e desempate pelo ganho de observação."""
+        start = cell(self.pose.x,self.pose.y)
+        parents = {start: None}
+        costs = {start: 0}
+        pending = deque([start])
+        candidates = {}
+        while pending:
+            key = pending.popleft()
+            x,y = (self.pose.x,self.pose.y) if key == start else midpoint(key)
+            if key != start:
+                visible = self.frontier_evidence(key)
+                if visible and deferred.get(key) != self.frontier_signature(key):
+                    candidates[key] = visible
+            for di,dj in ((0,1),(1,0),(0,-1),(-1,0)):
+                nxt = key[0]+di,key[1]+dj
+                if nxt in parents or (key,nxt) in excluded_edges:
+                    continue
+                nx,ny = midpoint(nxt)
+                if key == start and self.direction_blocked(math.degrees(math.atan2(nx-x,ny-y))):
+                    continue
+                if all(self.clear_disk(x+(nx-x)*t,y+(ny-y)*t) for t in (0,.25,.5,.75,1)):
+                    parents[nxt] = key
+                    costs[nxt] = costs[key]+1
+                    pending.append(nxt)
+
+        if target not in parents:
+            target = None
+        if target is None:
+            # Une candidatos vizinhos e mantém o ponto alcançável mais
+            # barato de cada grupo. A área desconhecida desempata grupos.
+            groups = []
+            remaining = set(candidates)
+            while remaining:
+                first = min(remaining)
+                remaining.remove(first)
+                group, queue = [first], [first]
+                while queue:
+                    i,j = queue.pop()
+                    for nxt in ((i+1,j),(i-1,j),(i,j+1),(i,j-1)):
+                        if nxt in remaining:
+                            remaining.remove(nxt)
+                            group.append(nxt)
+                            queue.append(nxt)
+                gain = len(set().union(*(candidates[k] for k in group)))
+                nearest = min(group,key=lambda k:(costs[k],-len(candidates[k]),k))
+                groups.append((costs[nearest],-gain,nearest))
+            if groups:
+                target = min(groups)[2]
+
+        path = []
+        cursor = target
+        while cursor is not None and cursor != start:
+            path.append(midpoint(cursor))
+            cursor = parents[cursor]
+        return target,path[::-1]
 
     def route(self):
         """Prioriza fronteiras e repassa por células conhecidas para mudar de ramo."""

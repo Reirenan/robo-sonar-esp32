@@ -94,3 +94,11 @@ O contorno violeta indica as células que impedem a manobra. A leitura curta (US
 Quando o avanço não tem folga, o painel agrupa os ecos acima de 45 cm em ângulos consecutivos. Cada abertura exige pelo menos dois raios. A largura é estimada pela corda entre os extremos, calculada no menor alcance do grupo e limitada à profundidade de 100 cm. Exige-se a largura do chassi mais 10 cm. O rumo aponta para o centro do grupo maior, com preferência pelo menor giro em empate e pela esquerda no empate final.
 
 O mapa ainda verifica a área ocupada durante o giro. Depois de girar, o sonar confere a nova frente antes de avançar. Sem rumo permissível na leitura curta, o painel usa a varredura completa antes de avaliar a ré. No mapa, as linhas tracejadas em ciano mostram a abertura e a seta ciano indica o rumo escolhido. O firmware existente é compatível.
+
+### Busca por fronteiras sem conhecer a saída
+
+O painel escolhe pontos livres alcançáveis que têm áreas desconhecidas à vista. A busca em largura usa a grade de 10 cm e verifica a folga do chassi. O custo do caminho tem prioridade e a quantidade de células desconhecidas desempata. A rota planejada aparece em azul tracejado e a trajetória realizada em verde.
+
+A fronteira permanece como alvo até ser observada ou até a rota deixar de ser alcançável. Depois de duas varreduras sem informação nova no alvo, o painel adia a fronteira até a região mudar. Se surgir um bloqueio, o controlador procura outro caminho para o mesmo alvo e usa Follow the Gap como desvio local. Toda tentativa de avanço continua sujeita à leitura frontal e ao corte de 45 cm.
+
+O mapa continua registrando passagens atravessadas. Em arena sem perímetro informado, verifique a saída e encerre a exploração com **Parar** ou **Esc**. Os testes automatizados cobrem retorno de beco, preservação do alvo, reabertura de fronteira e veto de avanço sem eco. O retorno e a travessia no piso precisam de validação na arena.
