@@ -2,7 +2,7 @@
 import math
 import time
 
-from Navegacao import cell, delta, relative
+from Navegacao import MapaAutomatico, cell, delta, relative, returns
 
 
 class StopRequested(Exception):
@@ -16,6 +16,8 @@ class Navigator:
         self.interrupt = interrupt
         self.notify = notify
         self.owns_session = False
+        self.automatic = isinstance(arena_map, MapaAutomatico)
+        self.valid_scan = False
 
     def check_stop(self):
         if self.interrupt.is_set():
@@ -46,6 +48,7 @@ class Navigator:
         self.notify("Varrendo a arena com as rodas paradas")
         self.command("start")
         state = self.wait_for(lambda s: s["state"] == "done", 45)
+        self.valid_scan = any(returns(state["points"]))
         self.map.scan(state["points"])
         self.notify("Pose confirmada pelo sonar" if self.map.localized else "Pose estimada, sem referência em duas paredes")
 
@@ -62,6 +65,11 @@ class Navigator:
         if elapsed:
             self.map.integrate(direction, elapsed)
         outcome = state["autoEnd"]
+        if self.automatic and direction == "f" and outcome in {"e","o"}:
+            self.map.blocked.add(self.map.chave_direcao(self.map.pose.heading))
+            self.notify("Sem eco frontal; procurando outro caminho" if outcome == "e"
+                        else "Obstáculo frontal; procurando outro caminho")
+            return False
         if outcome == "e":
             raise RuntimeError("Sem eco frontal válido. Avanço interrompido.")
         if outcome == "s":
@@ -75,6 +83,8 @@ class Navigator:
     def next_move(self):
         m, a = self.map, self.map.arena
         pose = m.pose
+        if self.automatic and (not self.valid_scan or m.uncertainty > 30):
+            return False
         path = m.route()
         if not path:
             current = cell(pose.x, pose.y)
@@ -109,6 +119,18 @@ class Navigator:
         rate = m.arena.left_rate if direction == "l" else m.arena.right_rate
         return self.move(direction, min(abs(degrees), 30), rate)
 
+    def explore(self):
+        # Uma passagem atravessada fica no mapa. Só o operador encerra a
+        # exploração normal; uma falha serial continua encerrando a sessão.
+        while True:
+            self.observe()
+            if not self.next_move():
+                self.notify("Aguardando passagem segura")
+                for _ in range(4):
+                    if self.interrupt.wait(.5):
+                        raise StopRequested
+                    self.command("state")
+
     def run(self):
         try:
             state = self.command("state")
@@ -118,6 +140,8 @@ class Navigator:
                 return "Confira o servo e a ponte H e aguarde o robô parar."
             self.command("auto_begin")
             self.owns_session = True
+            if self.automatic:
+                self.explore()
             for _ in range(180):
                 self.observe()
                 if not self.map.localized:

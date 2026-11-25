@@ -312,6 +312,8 @@ class Map:
     @classmethod
     def load(cls, path):
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if data["version"] == 2:
+            return MapaAutomatico.from_data(data)
         if data["version"] != 1:
             raise ValueError("Versão de mapa incompatível.")
         result = cls(Arena(**data["arena"]))
@@ -321,4 +323,254 @@ class Map:
         result.clearing = {(x,y): value for x,y,value in data["clearing"]}
         result.tentative = {tuple(key) for key in data.get("tentative", [])}
         result.exit, result.exited = data["exit"], data["exited"]
+        return result
+
+@dataclass(frozen=True)
+class PerfilAutomatico:
+    """Referência conservadora do carrinho, em cm e segundos.
+
+    As velocidades aproximadas servem para estimar a pose, enquanto o sonar
+    e o limite de tempo na ESP32 controlam a segurança de cada movimento.
+    """
+    robot_width: float = 25
+    robot_length: float = 30
+    speed: float = 25
+    left_rate: float = 100
+    right_rate: float = 100
+
+    @property
+    def radius(self):
+        return math.hypot(self.robot_width, self.robot_length) / 2 + MARGIN
+
+
+def reconhecer_pose(cells, predicted, points):
+    """Procura ecos repetidos em dois alinhamentos diferentes do mapa."""
+    references = {k for k, value in cells.items() if value == OCCUPIED}
+    surfaces = {
+        (x,y): (any((x+d,y) in references for d in (-2,-1,1,2)),
+                any((x,y+d) in references for d in (-2,-1,1,2)))
+        for x,y in references
+    }
+    samples = list(returns(points))
+    if len(samples) < 4 or not references:
+        return None
+
+    best = None
+    for da in (0,-5,5,-10,10):
+        heading = (predicted.heading + da) % 360
+        projected = [relative(a,d,heading) for a,d in samples]
+        for dx in (0,-5,5,-10,10):
+            for dy in (0,-5,5,-10,10):
+                x, y = predicted.x+dx, predicted.y+dy
+                horizontal, vertical = set(), set()
+                residual = 0
+                for px,py in projected:
+                    key = cell(x+px,y+py)
+                    along_x, along_y = surfaces.get(key,(False,False))
+                    if along_x == along_y:
+                        continue
+                    cx, cy = midpoint(key)
+                    if along_x and abs(py) >= abs(px)/3:
+                        horizontal.add(key)
+                        residual += abs(y+py-cy)
+                    elif along_y and abs(px) >= abs(py)/3:
+                        vertical.add(key)
+                        residual += abs(x+px-cx)
+                if min(len(horizontal),len(vertical)) < 2:
+                    continue
+                rank = (len(horizontal)+len(vertical), -residual-abs(da)*.3-math.hypot(dx,dy)*.25)
+                if best is None or rank > best[0]:
+                    best = rank, Pose(x,y,heading)
+    return best[1] if best else None
+
+
+class MapaAutomatico(Map):
+    """A origem é o local de partida. A área do mapa nasce dos ecos, sem paredes informadas."""
+
+    def __init__(self, profile=None):
+        self.profile = profile or PerfilAutomatico()
+        super().__init__(self.profile)
+        self.passages = {}
+        self.blocked = set()
+        self.uncertainty = 0
+        self.has_scan = False
+
+    @property
+    def bounds(self):
+        keys = set(self.cells) | set(self.tentative) | {cell(self.pose.x,self.pose.y), (0,0)}
+        return (min(i for i,_ in keys)*CELL, (max(i for i,_ in keys)+1)*CELL,
+                min(j for _,j in keys)*CELL, (max(j for _,j in keys)+1)*CELL)
+
+    def chave_direcao(self, heading):
+        return (*cell(self.pose.x,self.pose.y), round(heading/30)%12)
+
+    def direction_blocked(self, heading):
+        x,y,sector = self.chave_direcao(heading)
+        return any((x,y,(sector+offset)%12) in self.blocked for offset in (-1,0,1))
+
+    def scan(self, points):
+        corrected = reconhecer_pose(self.cells,self.pose,points) if self.has_scan else None
+        self.localized = corrected is not None
+        if corrected:
+            self.pose = corrected
+            self.uncertainty = 0
+            if len(self.trail) > 1:
+                self.trail[-1] = corrected
+        pose = self.pose
+        hits, free = set(), set()
+        for angle, cm in returns(points):
+            dx,dy = relative(angle,cm,pose.heading)
+            hits.add(cell(pose.x+dx,pose.y+dy))
+            free.update(ray_cells(pose.x,pose.y,dx,dy,CELL))
+        if self.has_scan and not self.localized:
+            self.tentative.update(hits - {k for k in hits if self.cells.get(k) == OCCUPIED})
+        else:
+            for key in hits:
+                self.cells[key] = OCCUPIED
+                self.tentative.discard(key)
+        # Um retorno novo confirma que a célula ainda não deve ser removida.
+        for key in hits:
+            self.clearing.pop(key,None)
+        for key in free-hits:
+            if self.cells.get(key) == OCCUPIED or key in self.tentative:
+                if not self.localized:
+                    continue
+                self.clearing[key] = self.clearing.get(key,0)+1
+                if self.clearing[key] < 2:
+                    continue
+                del self.clearing[key]
+                self.tentative.discard(key)
+            self.cells[key] = FREE
+        if hits:
+            self.has_scan = True
+        key = self.chave_direcao(pose.heading)
+        self.visited[key] = self.visited.get(key,0)+1
+        for angle, cm in returns(points):
+            if cm > 55:
+                self.blocked.discard(self.chave_direcao(pose.heading+angle-90))
+        self.observar_passagens(hits)
+
+    def clear_disk(self, x, y):
+        # Ecos de posição incerta ainda impedem que o planejador passe sobre
+        # o obstáculo observado. Também se preserva a folga ao integrar pulsos.
+        radius_margin = min(self.uncertainty,CELL)
+        offsets = ((0,0),(radius_margin,0),(-radius_margin,0),(0,radius_margin),(0,-radius_margin))
+        return all(self.cells.get(k) == FREE and k not in self.tentative
+                   for dx,dy in offsets for k in self.footprint(x+dx,y+dy))
+
+    def observar_passagens(self, hits):
+        # Duas bordas alinhadas e um corredor medido nos dois lados formam uma
+        # passagem possível. Sem perímetro declarado ela permanece provável.
+        required = math.ceil(2*self.profile.radius/CELL)
+        known = set(hits) | {k for k,v in self.cells.items() if v == OCCUPIED}
+        for i,j in hits:
+            for axis in (0,1):
+                for gap in range(required+1,required+6):
+                    mate = (i+gap,j) if axis == 0 else (i,j+gap)
+                    if mate not in known:
+                        continue
+                    across = 1-axis
+                    edge = (i,j)
+                    mid = list(midpoint(edge))
+                    mid[axis] += gap*CELL/2
+                    samples = []
+                    for offset in (-self.profile.radius,0,self.profile.radius):
+                        point = mid.copy()
+                        point[across] += offset
+                        samples.append(point)
+                    if not all(self.clear_disk(*point) for point in samples):
+                        continue
+                    key = (*cell(*mid),across)
+                    self.passages.setdefault(key, {"at": mid,"axis": across,"crossed": False})
+
+    def route(self):
+        """Prioriza fronteiras e repassa por células conhecidas para mudar de ramo."""
+        start = cell(self.pose.x,self.pose.y)
+        pending, parents = deque([start]), {start: None}
+        target, fallback, frontier = None, None, None
+        passage_targets = set()
+        for passage in self.passages.values():
+            if passage["crossed"]:
+                continue
+            axis = passage["axis"]
+            point = list(passage["at"])
+            origin = (self.pose.x,self.pose.y)[axis]
+            point[axis] += (1 if origin < point[axis] else -1) * (self.profile.radius + CELL)
+            passage_targets.add(cell(*point))
+        while pending:
+            key = pending.popleft()
+            x,y = (self.pose.x,self.pose.y) if key == start else midpoint(key)
+            if key != start:
+                if key in passage_targets:
+                    target = key
+                    break
+                distance = math.ceil(self.profile.radius/CELL)+1
+                seen = any(v[:2] == key for v in self.visited)
+                beyond = ((key[0]+distance,key[1]),(key[0]-distance,key[1]),
+                          (key[0],key[1]+distance),(key[0],key[1]-distance))
+                if not seen and any(k not in self.cells for k in beyond):
+                    if not passage_targets:
+                        target = key
+                        break
+                    if frontier is None:
+                        frontier = key
+                if fallback is None and sum(v[:2] == key for v in self.visited) < 12:
+                    fallback = key
+            for di,dj in ((0,1),(1,0),(0,-1),(-1,0)):
+                child = key[0]+di,key[1]+dj
+                if child in parents:
+                    continue
+                nx,ny = midpoint(child)
+                if not all(self.clear_disk(x+t*(nx-x),y+t*(ny-y)) for t in (0,.5,1)):
+                    continue
+                if key == start:
+                    heading = math.degrees(math.atan2(nx-x,ny-y))
+                    if self.direction_blocked(heading):
+                        continue
+                parents[child] = key
+                pending.append(child)
+
+        headings_here = sum(visit[:2] == start for visit in self.visited)
+        target = target or frontier or (fallback if headings_here >= 12 else None)
+        path = []
+        while target is not None and target != start:
+            path.append(midpoint(target))
+            target = parents[target]
+        return path[::-1]
+
+    def integrate(self,direction,elapsed_ms):
+        before = self.pose
+        super().integrate(direction,elapsed_ms)
+        after = self.pose
+        self.uncertainty += (math.hypot(after.x-before.x,after.y-before.y)*.06
+                             if direction == "f" else abs(delta(after.heading,before.heading))*.04)
+        for opening in self.passages.values():
+            axis = opening["axis"]
+            x0,x1 = (before.x,before.y)[axis], (after.x,after.y)[axis]
+            y0,y1 = (before.y,before.x)[axis], (after.y,after.x)[axis]
+            p,q = opening["at"][axis], opening["at"][1-axis]
+            if x0 != x1 and min(x0,x1) <= p <= max(x0,x1):
+                if abs(y0+(y1-y0)*(p-x0)/(x1-x0)-q) <= CELL:
+                    opening["crossed"] = True
+
+    def save(self,path):
+        path = Path(path)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps({
+            "version": 2,"pose": asdict(self.pose),"trail": [asdict(p) for p in self.trail],
+            "cells": [[*key,value] for key,value in sorted(self.cells.items())],
+            "tentative": sorted(self.tentative),"passages": list(self.passages.values()),
+            "clearing": [[*key,value] for key,value in self.clearing.items()],
+        }, ensure_ascii=False),encoding="utf-8")
+        temp.replace(path)
+
+    @classmethod
+    def from_data(cls,data):
+        result = cls()
+        result.pose = Pose(**data["pose"])
+        result.trail = [Pose(**p) for p in data["trail"]]
+        result.cells = {(x,y): value for x,y,value in data["cells"]}
+        result.tentative = {tuple(key) for key in data.get("tentative",[])}
+        result.clearing = {(x,y): value for x,y,value in data.get("clearing",[])}
+        result.passages = {(*cell(*entry["at"]),entry["axis"]): entry for entry in data["passages"]}
         return result
