@@ -24,15 +24,15 @@ class Abertura:
         return 2 * min(self.depth, 100) * math.sin(math.radians(self.last - self.first) / 2)
 
 
-def encontrar_aberturas(points, angular_step):
+def encontrar_aberturas(points, angular_step, min_depth=45):
     """Agrupa ecos úteis sem atravessar setores ausentes ou sem retorno."""
     runs = []
     current = []
     for angle, cm in sorted(points):
-        if current and (cm is None or not 45 < cm <= 400 or angle - current[-1][0] != angular_step):
+        if current and (cm is None or not min_depth < cm <= 400 or angle - current[-1][0] != angular_step):
             runs.append(current)
             current = []
-        if cm is not None and 45 < cm <= 400:
+        if cm is not None and min_depth < cm <= 400:
             current.append((angle, cm))
     runs.append(current)
     return [Abertura(run[0][0], run[-1][0], min(cm for _, cm in run))
@@ -172,7 +172,8 @@ class Navigator:
                 self.forward_at = time.monotonic()
             elif direction in {"l","r"}:
                 self.turns_since_scan += 1
-                self.rear_origin = None
+                # Um giro no lugar conserva o trecho percorrido. A ré só
+                # volta a ser elegível se o rumo se realinhar com esse trecho.
         if self.automatic and direction == "f" and outcome in {"e","o"}:
             self.map.blocked.add(self.map.chave_direcao(self.map.pose.heading))
             self.wait_reason = ("Sem eco frontal" if outcome == "e" else "Obstáculo frontal")
@@ -219,7 +220,8 @@ class Navigator:
     def gap_turns(self):
         m = self.map
         points = self.scan_points if self.side_readings_current else []
-        openings = encontrar_aberturas(points, 30 if self.scan_kind == "quick" else 10)
+        spacing = 30 if self.scan_kind == "quick" else 10
+        openings = encontrar_aberturas(points, spacing)
         cards = {}
         for side, sign in (("l", -1), ("r", 1)):
             echoes = [cm for angle, cm in points if (angle - 90) * sign > 0 and cm is not None]
@@ -228,13 +230,24 @@ class Navigator:
                 reason = "Abertura estreita ou sem feixes consecutivos"
             cards[side] = (min(echoes) if echoes else None, reason)
 
-        ranked = sorted(openings, key=lambda gap: (-gap.width, abs(gap.center - 90), gap.center))
+        if self.scan_kind == "full":
+            # A faixa de 45 cm é exigida para tracionar à frente. Uma
+            # lateral mais curta ainda pode permitir girar no próprio eixo.
+            # Usamos feixes contíguos de um só lado e conferimos toda a
+            # área varrida antes de acionar as rodas.
+            for sign in (-1, 1):
+                lateral = [(angle, cm) for angle, cm in points if (angle - 90) * sign > 0]
+                shallow = encontrar_aberturas(lateral, spacing, min_depth=m.arena.radius)
+                openings.extend(gap for gap in shallow if gap.depth <= 45)
+        ranked = sorted(openings, key=lambda g: (-g.width, abs(g.center - 90), g.center))
         options = []
         for gap in ranked:
             offset = gap.center - 90
             if gap.width < m.arena.robot_width + 10 or not offset:
                 continue
             side = "l" if offset < 0 else "r"
+            if any(direction == side for _, direction, _ in options):
+                continue
             if m.direction_blocked(m.pose.heading + offset):
                 cards[side] = (gap.depth, "Rumo bloqueado na última tentativa")
                 continue
@@ -255,9 +268,10 @@ class Navigator:
                     blockers = cells
             if turn:
                 options.append((gap, side, turn))
-                cards[side] = (gap.depth, f"Abertura estimada: {gap.width:.0f} cm")
+                label = "Folga para girar" if gap.depth <= 45 else "Abertura estimada"
+                cards[side] = (gap.depth, f"{label}: {gap.width:.0f} cm")
                 m.maneuver_blockers.pop(side, None)
-            elif not any(option[1] == side for option in options):
+            else:
                 if blockers:
                     m.maneuver_blockers[side] = blockers
                 cards[side] = (gap.depth, "Chassi sem folga no giro" if blockers else "Giros já avaliados")
@@ -289,6 +303,8 @@ class Navigator:
             side = "l" if sign < 0 else "r"
             if blockers:
                 m.maneuver_blockers[side] = blockers
+                distance, _ = m.directions.get(side, (None, ""))
+                m.directions[side] = (distance, "Chassi sem folga no giro")
                 continue
             self.turn_attempts.add(key)
             self.survey_turns[position,sign] += 1
@@ -316,7 +332,7 @@ class Navigator:
         options, cards = self.gap_turns()
         freason = ("Sem eco confiável" if front is None else "Obstáculo até 45 cm"
                    if front <= 45 else "Passagem livre" if forward else "Faixa sem folga confirmada")
-        m.directions = {**cards, "f": (front, freason)}
+        m.directions = {**cards, "f": (front, freason), "b": (None, "Avaliada se os lados bloquearem")}
         if forward:
             m.selected_direction = "f"
             return self.move("f",step,m.arena.speed)
@@ -326,16 +342,20 @@ class Navigator:
             for gap, direction, turn in options:
                 m.selected_direction = direction
                 m.selected_gap = (m.pose, gap)
-                m.directions[direction] = (gap.depth, f"Rumo {gap.center - 90:+.0f}° · abertura {gap.width:.0f} cm")
+                m.directions[direction] = (gap.depth, f"Giro {turn:+.0f}° · folga {gap.width:.0f} cm")
                 self.turn_attempts.add(self.turn_key(turn))
                 if self.turn(turn):
                     return True
             m.selected_direction = None
             m.selected_gap = None
+            # Antes de explorar um rumo sem abertura conhecida, recua pelo
+            # trecho verificado. A sondagem curta não autoriza essa manobra.
+            if self.scan_kind == "full":
+                if self.backtrack():
+                    return True
+            else:
+                m.directions["b"] = (None, "Aguardando varredura completa")
             if self.survey_turn():
-                return True
-            # Uma sondagem esparsa nunca é suficiente para optar pela ré.
-            if self.scan_kind == "full" and self.backtrack():
                 return True
         self.wait_reason = "Posição incerta" if m.uncertainty > 30 else freason + " · sem manobra com folga"
         return False
@@ -387,24 +407,36 @@ class Navigator:
     def backtrack(self):
         m = self.map
         pose = m.pose
-        if (not self.reverse_limit or self.rear_origin is None or not m.localized
-                or time.monotonic()-self.forward_at > 90
-                or abs(delta(pose.heading,self.rear_heading)) > 5):
+        if not self.reverse_limit:
+            m.directions["b"] = (None, "Ré indisponível na ESP32")
+            return False
+        if self.rear_origin is None or time.monotonic()-self.forward_at > 90:
+            m.directions["b"] = (None, "Sem trecho recente atrás")
+            return False
+        if not m.localized:
+            m.directions["b"] = (None, "Aguardando posição confirmada")
+            return False
+        if abs(delta(pose.heading,self.rear_heading)) > 5:
+            m.directions["b"] = (None, "Chassi fora do rumo do trecho")
             return False
         fx,fy = relative(90,1,self.rear_heading)
         dx,dy = pose.x-self.rear_origin.x,pose.y-self.rear_origin.y
         if abs(dx*fy-dy*fx) > 2:
+            m.directions["b"] = (None, "Chassi fora do trecho percorrido")
             return False
         # Reserva 0,5 cm na origem e não extrapola o trecho já percorrido.
         # A folga é conferida ao longo do pulso, com o retângulo do chassi.
         remaining = dx*fx+dy*fy-.5
         step = min(remaining,m.arena.speed*self.reverse_limit/1000)
         if step < m.arena.speed*.040:
+            m.directions["b"] = (None, "Limite do trecho percorrido")
             return False
         for cm in range(math.ceil(step)+1):
             bx,by = relative(90,-min(cm,step),pose.heading)
             if not m.clear_reverse_body(pose.x+bx,pose.y+by):
+                m.directions["b"] = (None, "Sem folga atrás no mapa")
                 return False
+        m.directions["b"] = (step, "Pulso pelo trecho percorrido")
         m.selected_direction = "b"
         return self.move("b",step,m.arena.speed)
 
@@ -448,7 +480,7 @@ class Navigator:
     def pursue_frontier(self, front, allow_turn, replan=True):
         """Executa um trecho da rota e pede desvio apenas se ela bloquear."""
         m = self.map
-        if m.frontier_target is None or not m.frontier_path:
+        if m.frontier_target is None or not m.frontier_path or front is None or front <= 45:
             return self.decision(front,allow_turn)
         pose = m.pose
         if m.uncertainty > 30:

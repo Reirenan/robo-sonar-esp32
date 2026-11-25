@@ -68,7 +68,7 @@ Alimente o SG90 e o HC-SR04 com 5 V regulados e compartilhe o GND com a ESP32 e 
 
 ### Recuperação por ré
 
-Se o robô ficar bloqueado, o painel procura primeiro um giro com folga. A ré fica limitada a **120 ms** por pulso e só é autorizada sobre o último trecho reto percorrido, enquanto a posição for confiável e a faixa atrás do chassi continuar livre no mapa. O sonar mede à frente. Ao iniciar cercado, sem histórico traseiro, o robô mantém as rodas paradas. Pressione **Parar** ou **Esc** para cancelar.
+Se a frente bloquear, o painel compara esquerda e direita antes da ré. Uma lateral abaixo de 45 cm pode permitir um giro no lugar se a varredura completa e a área do chassi confirmarem folga. O painel mostra a razão de cada decisão. A ré fica limitada a **120 ms** por pulso e só é autorizada sobre o último trecho reto percorrido, enquanto a posição for confiável e a faixa atrás do chassi continuar livre no mapa. O giro no lugar preserva esse histórico para quando o chassi voltar a se alinhar. O sonar mede à frente. Se todos os giros estiverem bloqueados na partida e ainda faltar um trecho traseiro conhecido, o robô mede de novo com as rodas paradas. Pressione **Parar** ou **Esc** para cancelar.
 
 O estado serial inclui `reverseMaxMs` e `rawPulses`. Os cinco pulsos brutos em microssegundos por ângulo aparecem na ordem de aquisição. Zero representa ausência de pulso capturado. Compare uma varredura com caixa e outra sem caixa para distinguir marca antiga de um eco que ainda chega ao sensor.
 

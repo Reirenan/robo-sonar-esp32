@@ -40,18 +40,18 @@ class Panel:
         self.cards = {}
         strip = tk.Frame(body,bg="#e8edf2")
         strip.pack(fill="x",pady=(12,0))
-        for column,(direction,label) in enumerate((("l","ESQUERDA"),("f","FRENTE"),("r","DIREITA"))):
+        for column,(direction,label) in enumerate((("l","ESQUERDA"),("f","FRENTE"),("r","DIREITA"),("b","RÉ"))):
             strip.columnconfigure(column,weight=1,uniform="direcoes")
             card = tk.Frame(strip,bg="#f5f8fb",padx=12,pady=8)
             card.grid(row=0,column=column,sticky="nsew",padx=(0 if column==0 else 4,0))
             title = tk.Label(card,text=label,bg="#f5f8fb",fg="#415568",font=("Segoe UI",9,"bold"),anchor="w")
             value = tk.Label(card,text="—",bg="#f5f8fb",fg="#112838",font=("Segoe UI",19,"bold"),anchor="w")
-            reason = tk.Label(card,text="Aguardando leitura",bg="#f5f8fb",fg="#415568",anchor="w",justify="left")
+            reason = tk.Label(card,text="Aguardando leitura",bg="#f5f8fb",fg="#415568",anchor="w",justify="left",wraplength=155)
             for widget in (title,value,reason):
                 widget.pack(fill="x")
             self.cards[direction] = card,title,value,reason
 
-        self.status = ttk.Label(body,text="Pronto. Posicione o robô em área livre antes de iniciar.",
+        self.status = ttk.Label(body,text="Pronto para iniciar a exploração.",
                                 wraplength=760,padding=(0,9))
         self.status.pack(fill="x")
         view = ttk.Frame(body)
