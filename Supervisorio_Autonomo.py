@@ -120,6 +120,7 @@ class Panel:
         result.selected_direction = model.selected_direction
         result.selected_gap = model.selected_gap
         result.frontier_target = model.frontier_target
+        result.edge_target = model.edge_target
         result.frontier_path = list(model.frontier_path)
         result.maneuver_blockers = {d:set(keys) for d,keys in model.maneuver_blockers.items()}
         result.localized = model.localized
@@ -242,10 +243,13 @@ class Panel:
             c.create_line(*xy(m.pose.x,m.pose.y), *[v for point in route for v in xy(*point)],
                           fill="#80b9ff",dash=(6,4),width=2)
         target = getattr(m,"frontier_target",None)
+        inspecting = getattr(m,"edge_target",None)
+        if target is None:
+            target = inspecting
         if target is not None:
             tx,ty = xy(*midpoint(target))
             c.create_oval(tx-6,ty-6,tx+6,ty+6,outline="#80b9ff",width=2)
-            c.create_text(tx+9,ty-9,anchor="w",text="Fronteira",fill="#b6d6ff")
+            c.create_text(tx+9,ty-9,anchor="w",text="Inspeção da borda" if inspecting is not None else "Fronteira",fill="#b6d6ff")
         selection = getattr(m, "selected_gap", None)
         if selection:
             pose, gap = selection

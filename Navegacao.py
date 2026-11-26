@@ -412,6 +412,8 @@ class MapaAutomatico(Map):
         self.selected_direction = None
         self.selected_gap = None
         self.frontier_target = None
+        self.edge_target = None
+        self.last_scan_hits = set()
         self.frontier_path = []
         self.maneuver_blockers = {}
         self.tentative_reference = None
@@ -457,6 +459,7 @@ class MapaAutomatico(Map):
             dx,dy = relative(angle,cm,pose.heading)
             hits.add(cell(sensor_x+dx,sensor_y+dy))
             free.update(ray_cells(sensor_x,sensor_y,dx,dy,CELL))
+        self.last_scan_hits = hits
         if self.has_scan and not self.localized:
             # Na mesma pose, uma célula que bloqueou a manobra só perde
             # o veto provisório quando um feixe válido passa além dela.
@@ -637,20 +640,14 @@ class MapaAutomatico(Map):
                      for i in range(key[0]-radius,key[0]+radius+1)
                      for j in range(key[1]-radius,key[1]+radius+1))
 
-    def plan_frontier(self, target, deferred, excluded_edges=()):
-        """Busca em largura com folga e desempate pelo ganho de observação."""
+    def reachable_cells(self, excluded_edges):
+        """Constroi rotas apenas por faixas livres com folga para o chassi."""
         start = cell(self.pose.x,self.pose.y)
-        parents = {start: None}
-        costs = {start: 0}
+        parents, costs = {start: None}, {start: 0}
         pending = deque([start])
-        candidates = {}
         while pending:
             key = pending.popleft()
             x,y = (self.pose.x,self.pose.y) if key == start else midpoint(key)
-            if key != start:
-                visible = self.frontier_evidence(key)
-                if visible and deferred.get(key) != self.frontier_signature(key):
-                    candidates[key] = visible
             for di,dj in ((0,1),(1,0),(0,-1),(-1,0)):
                 nxt = key[0]+di,key[1]+dj
                 if nxt in parents or (key,nxt) in excluded_edges:
@@ -662,6 +659,58 @@ class MapaAutomatico(Map):
                     parents[nxt] = key
                     costs[nxt] = costs[key]+1
                     pending.append(nxt)
+        return parents,costs
+
+    @staticmethod
+    def path_to(target, parents):
+        path = []
+        while target is not None and parents[target] is not None:
+            path.append(midpoint(target))
+            target = parents[target]
+        return path[::-1]
+
+    def edge_cells(self):
+        return {(i,j) for (i,j),value in self.cells.items() if value == OCCUPIED
+                and any(self.cells.get(k) == FREE and k not in self.tentative
+                        for k in ((i-1,j),(i+1,j),(i,j-1),(i,j+1)))}
+
+    def plan_edge(self, target, remaining, deferred, excluded_edges):
+        """Busca um ponto livre com visada para a face conhecida da borda."""
+        parents,costs = self.reachable_cells(excluded_edges)
+        start = cell(self.pose.x,self.pose.y)
+        reach = self.profile.radius + 4*CELL
+        candidates = {}
+        for key in parents:
+            x,y = (self.pose.x,self.pose.y) if key == start else midpoint(key)
+            if not self.clear_disk(x,y) or (key in deferred and deferred[key] == self.frontier_signature(key)):
+                continue
+            visible = set()
+            for edge in remaining:
+                ex,ey = midpoint(edge)
+                dx,dy = ex-x,ey-y
+                if math.hypot(dx,dy) > reach:
+                    continue
+                line = ray_cells(x,y,dx,dy,0) - {edge}
+                if all(self.cells.get(k) == FREE and k not in self.tentative for k in line):
+                    visible.add(edge)
+            if visible:
+                candidates[key] = visible
+        if target not in candidates:
+            target = min(candidates,key=lambda k: (costs[k],-len(candidates[k]),k),default=None)
+        if target is None:
+            return None,[],set()
+        return target,self.path_to(target,parents),candidates[target]
+
+    def plan_frontier(self, target, deferred, excluded_edges=()):
+        """Busca em largura com folga e desempate pelo ganho de observação."""
+        start = cell(self.pose.x,self.pose.y)
+        parents,costs = self.reachable_cells(excluded_edges)
+        candidates = {}
+        for key in parents:
+            if key != start:
+                visible = self.frontier_evidence(key)
+                if visible and deferred.get(key) != self.frontier_signature(key):
+                    candidates[key] = visible
 
         if target not in parents:
             target = None
@@ -687,12 +736,7 @@ class MapaAutomatico(Map):
             if groups:
                 target = min(groups)[2]
 
-        path = []
-        cursor = target
-        while cursor is not None and cursor != start:
-            path.append(midpoint(cursor))
-            cursor = parents[cursor]
-        return target,path[::-1]
+        return target,self.path_to(target,parents)
 
     def route(self):
         """Prioriza fronteiras e repassa por células conhecidas para mudar de ramo."""

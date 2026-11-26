@@ -66,6 +66,12 @@ Alimente o SG90 e o HC-SR04 com 5 V regulados e compartilhe o GND com a ESP32 e 
 - O planejador prioriza fronteiras e usa células livres para retornar a uma área com outras direções possíveis. Se cair numa situação sem passagem observável, mantém as rodas paradas, informa **Aguardando passagem segura** e volta a medir. Uma queda da COM3 encerra a sessão.
 - Uma passagem provável precisa de bordas observadas e de folga medível dos dois lados. Sem delimitar o perímetro, o sonar não consegue garantir que a passagem é a saída da arena. A marca some após duas varreduras válidas além dela. Com o robô imóvel, vale a última posição confiável. Depois de mover as rodas, o sonar precisa reconhecer a posição novamente. Âmbar com **1/2** indica a primeira confirmação. Uma marca sem retorno correspondente continua aguardando confirmação.
 
+### Inspeção de bordas
+
+Quando o mapa não oferece uma fronteira alcançável, o painel procura pontos livres com visada para a junção de uma parede mapeada com o espaço livre. O robô segue a rota indicada, para no ponto de observação e faz uma varredura completa. Só ecos válidos recebidos nesse ponto contam como inspeção. Dois resultados inconclusivos adiam o ponto até a vizinhança mudar. Caso uma abertura revele uma fronteira alcançável, a exploração por fronteiras volta a ter prioridade.
+
+O mapa indica o ponto de inspeção e a rota até ele. Quando acabar o espaço alcançável, o robô continua medindo com as rodas paradas. Uma borda sem rota permanece pendente. Uma abertura marcada como provável continua visível depois da travessia.
+
 ### Recuperação por ré
 
 Se a frente bloquear, o painel compara esquerda e direita antes da ré. Uma lateral abaixo de 45 cm pode permitir um giro no lugar se a varredura completa e a área do chassi confirmarem folga. O painel mostra a razão de cada decisão. A ré fica limitada a **120 ms** por pulso e só é autorizada sobre o último trecho reto percorrido, enquanto a posição for confiável e a faixa atrás do chassi continuar livre no mapa. O giro no lugar preserva esse histórico para quando o chassi voltar a se alinhar. O sonar mede à frente. Se todos os giros estiverem bloqueados na partida e ainda faltar um trecho traseiro conhecido, o robô mede de novo com as rodas paradas. Pressione **Parar** ou **Esc** para cancelar.

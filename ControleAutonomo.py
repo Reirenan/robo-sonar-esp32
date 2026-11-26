@@ -5,7 +5,7 @@ import math
 import time
 from statistics import median
 
-from Navegacao import MapaAutomatico, cell, delta, relative, returns
+from Navegacao import MapaAutomatico, cell, delta, midpoint, relative, returns
 
 
 @dataclass(frozen=True)
@@ -71,6 +71,13 @@ class Navigator:
         self.blocked_edges = {}
         self.frontier_baseline = set()
         self.frontier_observations = 0
+        self.inspected_edges = set()
+        self.deferred_edge_points = {}
+        self.edge_visible = set()
+        self.edge_observations = 0
+        self.scan_sequence = 0
+        self.edge_scan_seen = 0
+        self.edge_wait = ""
 
     def check_stop(self):
         if self.interrupt.is_set():
@@ -98,7 +105,8 @@ class Navigator:
         raise RuntimeError("A ESP32 não concluiu a operação a tempo.")
 
     def observe(self):
-        self.notify("Atualizando mapa · rodas paradas")
+        prefix = "Inspecionando bordas · " if getattr(self.map,"edge_target",None) is not None else ""
+        self.notify(prefix + "Atualizando mapa · rodas paradas")
         self.command("start")
         reported = 0
 
@@ -110,7 +118,7 @@ class Navigator:
             if count > reported and (count - reported >= 4 or count == 19):
                 reported = count
                 status = "Sensor voltando ao centro" if count == 19 else f"Varredura · {count}/19 ângulos"
-                self.notify(status + " · rodas paradas")
+                self.notify(prefix + status + " · rodas paradas")
             return False
 
         state = self.wait_for(scan_finished, 45)
@@ -121,12 +129,13 @@ class Navigator:
         self.turn_budget_used = 0
         self.valid_scan = any(returns(self.scan_points))
         self.map.scan(state["points"])
+        self.scan_sequence += 1
         summary = "Posição de referência confirmada" if self.map.localized else "Posição estimada"
         if self.map.clearing:
             summary += f" · {len(self.map.clearing)} marca(s) com 1 de 2 confirmações de remoção"
         if getattr(self.map,"awaiting_echo",None):
             summary += f" · {len(self.map.awaiting_echo)} aguardando confirmação de eco"
-        self.notify(summary)
+        self.notify(prefix + summary)
 
     def quick_observe(self):
         self.notify("Leitura rápida · rodas paradas")
@@ -337,14 +346,14 @@ class Navigator:
         m.selected_direction = None
         return False
 
-    def decision(self, front, allow_turn):
+    def decision(self, front, allow_turn, allow_forward=True):
         m = self.map
         m.selected_direction = None
         m.selected_gap = None
         m.maneuver_blockers = {}
         distance_budget, _ = self.scan_budget()
         step = min(m.arena.speed*.350,distance_budget-self.since_scan)
-        forward = front is not None and front > 45 and step >= m.arena.speed*.040
+        forward = allow_forward and front is not None and front > 45 and step >= m.arena.speed*.040
         if forward:
             blockers = m.swept_blockers(distance=step)
             if blockers:
@@ -483,6 +492,8 @@ class Navigator:
                 self.deferred_frontiers[target] = m.frontier_signature(target)
                 target = None
             else:
+                m.edge_target = None
+                self.edge_wait = ""
                 m.frontier_path = []
                 m.maneuver_blockers = {}
                 self.notify("Observando a fronteira novamente")
@@ -497,11 +508,95 @@ class Navigator:
             self.frontier_baseline = m.frontier_evidence(chosen) if chosen is not None else set()
             self.frontier_observations = 0
         m.frontier_target, m.frontier_path = chosen,path
+        if chosen is not None:
+            m.edge_target = None
+            self.edge_wait = ""
+        else:
+            self.plan_edges(current, excluded)
+
+    def plan_edges(self, current, excluded):
+        m = self.map
+        target = m.edge_target
+        edges = m.edge_cells()
+        self.inspected_edges.intersection_update(edges)
+        # Conta uma observação por varredura completa, nunca por chamada
+        # ao planejador ou por sondagem curta no caminho.
+        if (target == current and self.scan_sequence != self.edge_scan_seen
+                and self.scan_kind == "full" and self.side_readings_current):
+            self.edge_scan_seen = self.scan_sequence
+            hits = self.edge_visible & m.last_scan_hits & edges
+            self.inspected_edges.update(hits)
+            if hits:
+                self.edge_observations = 0
+            elif self.edge_alignment() is None:
+                self.edge_observations += 1
+            if self.edge_observations >= 2:
+                self.deferred_edge_points[target] = m.frontier_signature(target)
+                target = None
+        remaining = edges - self.inspected_edges
+        chosen, path, visible = (m.plan_edge(target,remaining,self.deferred_edge_points,excluded)
+                                 if remaining else (None,[],set()))
+        changed = chosen != m.edge_target
+        if changed:
+            self.edge_observations = 0
+        m.edge_target, m.frontier_path = chosen,path
+        self.edge_visible = visible
+        self.edge_wait = ""
+        if chosen is not None:
+            if changed:
+                self.notify("Inspecionando bordas · rota de observação")
+        elif edges:
+            self.edge_wait = ("Bordas restantes sem rota segura" if remaining
+                              else "Bordas alcançáveis verificadas")
+
+    def edge_alignment(self):
+        m = self.map
+        if not self.valid_scan or m.uncertainty > 30:
+            return None
+        sx,sy = m.sonar_origin(m.pose)
+        turns = []
+        for key in self.edge_visible - self.inspected_edges:
+            x,y = midpoint(key)
+            turn = delta(math.degrees(math.atan2(x-sx,y-sy)),m.pose.heading)
+            if abs(turn) > 85:
+                turns.append(turn)
+        for turn in sorted(set(turns),key=lambda angle: (abs(angle),angle)):
+            rate = m.arena.left_rate if turn < 0 else m.arena.right_rate
+            for size in (25,15,10,5):
+                rotation = math.copysign(size,turn)
+                if (size / rate >= .040 and self.turn_key(rotation) not in self.turn_attempts
+                        and m.swept_clear(turn=rotation)):
+                    return rotation
+        return None
+
+    def inspect_edge(self, allow_turn):
+        m = self.map
+        self.wait_reason = "Inspecionando bordas · varredura no ponto de observação"
+        m.selected_direction = None
+        rotation = (self.edge_alignment()
+                    if allow_turn and self.side_readings_current and self.scan_kind == "full" else None)
+        if rotation is None:
+            return False
+        self.turn_attempts.add(self.turn_key(rotation))
+        m.selected_direction = "l" if rotation < 0 else "r"
+        self.notify("Inspecionando bordas · alinhando o sonar")
+        return self.turn(rotation)
 
     def pursue_frontier(self, front, allow_turn, replan=True):
         """Executa um trecho da rota e pede desvio apenas se ela bloquear."""
         m = self.map
-        if m.frontier_target is None or not m.frontier_path or front is None or front <= 45:
+        if self.edge_wait:
+            if self.edge_wait == "Bordas restantes sem rota segura" and allow_turn:
+                # Um giro de observação ou uma ré verificada ainda pode
+                # revelar uma rota. Sem alvo, não repete avanços a esmo.
+                if self.decision(front, allow_turn=True, allow_forward=False):
+                    return True
+            self.wait_reason = self.edge_wait
+            return False
+        inspecting = m.edge_target is not None
+        if inspecting and not m.frontier_path:
+            return self.inspect_edge(allow_turn)
+        if not inspecting and (m.frontier_target is None or not m.frontier_path or front is None or front <= 45):
             return self.decision(front,allow_turn)
         pose = m.pose
         if m.uncertainty > 30:
@@ -532,7 +627,10 @@ class Navigator:
             if step >= m.arena.speed*.040 and m.swept_clear(distance=step):
                 m.selected_direction = "f"
                 known = any(visit[:2] == cell(*waypoint) for visit in m.visited)
-                self.notify("Voltando por caminho conhecido" if known else "Indo para uma nova área")
+                if inspecting:
+                    self.notify("Inspecionando bordas · seguindo até o ponto de observação")
+                else:
+                    self.notify("Voltando por caminho conhecido" if known else "Indo para uma nova área")
                 # Se a ESP32 vetar o pulso, a frente precisa ser medida
                 # novamente antes de tentar outro avanço.
                 return self.move("f",step,m.arena.speed)
@@ -540,6 +638,9 @@ class Navigator:
         if not allow_turn:
             return False
         if not replan:
+            if inspecting:
+                self.wait_reason = "Bordas restantes sem rota segura"
+                return False
             return self.decision(front,allow_turn=True)
         # Uma aresta rejeitada volta a ser elegível se a região mudar.
         origin,destination = cell(pose.x,pose.y),cell(*waypoint)
@@ -548,6 +649,9 @@ class Navigator:
         if m.frontier_path and m.frontier_path[0] != waypoint:
             self.notify("Rota recalculada · seguindo pela área conhecida")
             return self.pursue_frontier(front,allow_turn=True,replan=False)
+        if inspecting or self.edge_wait:
+            self.wait_reason = self.edge_wait or "Bordas restantes sem rota segura"
+            return False
         return self.decision(front,allow_turn=True)
 
     def explore(self):
@@ -575,8 +679,9 @@ class Navigator:
                         reason = "distância percorrida" if self.turn_budget_used < turn_budget else "giros acumulados"
                         self.notify(f"Atualizando mapa · limite de {reason}")
                         break
-                    if self.map.frontier_target is not None:
-                        if cell(self.map.pose.x,self.map.pose.y) == self.map.frontier_target:
+                    target = self.map.frontier_target if self.map.frontier_target is not None else self.map.edge_target
+                    if target is not None:
+                        if cell(self.map.pose.x,self.map.pose.y) == target:
                             self.map.frontier_path = []
                             break
                         self.plan_frontier()
@@ -586,8 +691,11 @@ class Navigator:
                         continue
                     break
                 continue
-            self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
-                        else "Aguardando passagem segura · "+self.wait_reason)
+            if self.wait_reason.startswith(("Bordas","Inspecionando bordas")):
+                self.notify(self.wait_reason)
+            else:
+                self.notify("Aguardando passagem segura" if self.wait_reason == "Aguardando passagem segura"
+                            else "Aguardando passagem segura · "+self.wait_reason)
             for _ in range(4):
                 if self.interrupt.wait(.5):
                     raise StopRequested
